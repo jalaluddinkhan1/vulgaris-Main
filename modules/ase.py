@@ -143,14 +143,29 @@ class AdaptiveSignalEmbedding(Module):
         return out  # (B, C_out, T_out)
 
     # ------------------------------------------------------------------
-    def forward(self, x: Tensor, timestamps: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        timestamps: Optional[Tensor] = None,
+        mask: Optional[np.ndarray] = None,
+    ) -> Tensor:
         """
         x          : (batch, in_channels, T)
         timestamps : optional (batch, T) — normalize to [0,1] and append as extra channel
+        mask       : optional boolean array, (batch, T) or (batch, in_channels, T).
+                     True = valid, False = missing. Missing positions are zeroed before
+                     convolution so they do not contaminate neighbouring timesteps.
         Returns    : (batch, T, latent_dim)
         """
         B, C, T = x.data.shape
-        x_np = x.data  # work in numpy for the wavelet convolution
+        # Apply missing-value mask before any computation
+        if mask is not None:
+            mask_np = np.asarray(mask, dtype=np.float32)
+            if mask_np.ndim == 2:          # (B, T) -> broadcast over channels
+                mask_np = mask_np[:, None, :]
+            x_np = x.data * mask_np        # zero out missing positions
+        else:
+            x_np = x.data  # work in numpy for the wavelet convolution
 
         if timestamps is not None:
             ts_np = timestamps.data  # (B, T)

@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from engine.tensor import Tensor, Parameter, zeros, ones, randn, rand, cat, stack
 from engine.module import Module
-from engine.layers import Linear, LayerNorm, RMSNorm, Dropout, SwiGLU
+from engine.layers import Linear, LayerNorm, RMSNorm, Dropout, SwiGLU, CausalAttention, RevIN
 
 from modules.ase import AdaptiveSignalEmbedding
 from modules.sssr import SelectiveSSR
@@ -77,6 +77,9 @@ class Vulgaris(Module):
         self.output_dim = config.output_dim
         self.n_classes = config.n_classes
 
+        # ── Reversible Instance Normalisation (applied before ASE) ────────
+        self.revin = RevIN(num_features=config.input_dim, eps=1e-5, affine=True)
+
         # ── Core modules ──────────────────────────────────────────────────
         self.ase = AdaptiveSignalEmbedding(
             in_channels=config.input_dim,
@@ -93,6 +96,9 @@ class Vulgaris(Module):
         )
 
         self.sssr = SelectiveSSR(d_model=d_model, config=config.sssr)
+
+        # ── Causal attention (post-SSSR, pre-CRG) ─────────────────────────
+        self.attn = CausalAttention(d_model=d_model, n_heads=max(1, d_model // 64))
 
         self.crg = CausalRoutingGraph(d_model=d_model, config=config.crg)
 
@@ -172,6 +178,7 @@ class Vulgaris(Module):
         domain_idx: int = 0,
         timestamps: Optional[Tensor] = None,
         use_safety: bool = False,
+        mask: Optional[np.ndarray] = None,
     ) -> Tuple[Tensor, dict]:
         """
         x: (batch, in_channels, T) or List[Tensor] for multi-modal
@@ -221,8 +228,9 @@ class Vulgaris(Module):
             z = fused
 
         else:
-            # ── Single-modality path: ASE ─────────────────────────────────
-            z = self.ase(x, timestamps)   # (B, T, d_model)
+            # ── Single-modality path: RevIN → ASE ────────────────────────
+            x_norm = self.revin.normalize(x)   # (B, C, T) instance-normalised
+            z = self.ase(x_norm, timestamps, mask=mask)   # (B, T, d_model)
 
         # ── HTD ──────────────────────────────────────────────────────────
         z_htd, _ = self.htd(z)
@@ -231,6 +239,10 @@ class Vulgaris(Module):
         # ── SSSR ─────────────────────────────────────────────────────────
         z_ssm, _ = self.sssr(z)
         z = z + z_ssm
+
+        # ── Causal Attention ─────────────────────────────────────────────
+        z_attn = self.attn(z)
+        z = z + z_attn
 
         # ── DAH: apply domain adapter as residual on SSM output ───────────
         # skip_proj maps d_model→d_model so its adapter is shape-compatible with z
@@ -378,6 +390,51 @@ class Vulgaris(Module):
             htd_states=htd_states,
             step=0,
         )
+
+    def rollout(
+        self,
+        x: Tensor,
+        horizon: int,
+        domain_idx: int = 0,
+    ) -> Tensor:
+        """
+        Autoregressive multi-step ahead forecasting.
+
+        Runs the context window through step() to warm up the recurrent state,
+        then rolls out `horizon` steps, feeding each prediction back as the next
+        input (unknown channels padded with zeros).
+
+        Args:
+            x       : (batch, in_channels, T)  — context window
+            horizon : number of future steps to predict
+            domain_idx : domain adapter index
+
+        Returns:
+            predictions : (batch, horizon, output_dim) as a plain Tensor (no grad)
+        """
+        self.eval()
+        B, C, T = x.data.shape
+        state = self.init_state(B)
+
+        # Warm up state on context window
+        for t in range(T):
+            x_t = Tensor(x.data[:, :, t])        # (B, C)
+            _, state = self.step(x_t, state, domain_idx)
+
+        # Autoregressive rollout
+        predictions = []
+        last_x = Tensor(x.data[:, :, -1])        # (B, C) — seed from last context step
+        for _ in range(horizon):
+            output_t, state = self.step(last_x, state, domain_idx)   # (B, output_dim)
+            predictions.append(output_t.data.copy())
+            # Project prediction back to input space (fill known dims, zero the rest)
+            next_input = np.zeros((B, C), dtype=np.float32)
+            out_dim = output_t.data.shape[-1]
+            next_input[:, :min(out_dim, C)] = output_t.data[:, :min(out_dim, C)]
+            last_x = Tensor(next_input)
+
+        preds_np = np.stack(predictions, axis=1)  # (B, horizon, output_dim)
+        return Tensor(preds_np)
 
     def set_domain(self, domain_idx: int):
         """Switch domain adapter."""

@@ -37,55 +37,32 @@ class CausalRoutingGraph(Module):
                            np.zeros((config.n_nodes, config.n_nodes), dtype=np.float64))
 
     def _dag_penalty(self) -> Tensor:
-        """
-        h(W) = tr(expm(W ⊙ W)) - n
-        expm approximated by truncated power series (6 terms):
-        I + A + A^2/2! + A^3/3! + A^4/4! + A^5/5! + A^6/6!
-        where A = W ⊙ W  (elementwise square).
-        Returns scalar Tensor with gradient.
-        """
+        from scipy.linalg import expm as scipy_expm
         n = self.n_nodes
-        # A = W^2 elementwise — differentiable through W
-        A = self.W * self.W                  # Tensor (n, n)
+        W_np = self.W.data           # (n, n) numpy float64
+        A_np = W_np ** 2             # element-wise square
+        expm_A = scipy_expm(A_np)    # (n, n) exact matrix exponential
+        trace_val = float(np.trace(expm_A))
 
-        # Build power series sum via Tensor matmul
-        I_data = np.eye(n, dtype=np.float64)
-        I_t = Tensor(I_data, requires_grad=False)
-
-        # result = I + A + A^2/2 + ... + A^6/720
-        # We accumulate using Tensor ops so gradients flow through W
-        result = I_t + A
-        A_k = A                               # A^1
-        factorial = 1.0
-        for k in range(2, 7):
-            factorial *= k
-            A_k = A_k @ A                    # A^k
-            result = result + A_k * (1.0 / factorial)
-
-        # trace = sum of diagonal elements
-        trace_val = result.data.trace()
-        # Gradient of trace(expm(A)) w.r.t. result: diagonal selector
-        # We wrap as Tensor op manually
-        trace_t = Tensor(
-            np.array([[trace_val]], dtype=np.float64),
-            requires_grad=result.requires_grad,
-            _children=(result,),
-            _op="trace"
+        out = Tensor(
+            np.array([[trace_val - n]], dtype=np.float64),
+            requires_grad=self.W.requires_grad,
+            _children=(self.W,),
+            _op="dag_penalty"
         )
 
-        _result = result
+        _W = self.W
+        _expm_A = expm_A.copy()
 
-        def _trace_back():
-            if _result.requires_grad and trace_t.grad is not None:
-                g = float(trace_t.grad.sum())
-                contrib = np.eye(n, dtype=np.float64) * g
-                _result.grad = (_result.grad + contrib
-                                if _result.grad is not None else contrib)
+        def _back():
+            if _W.requires_grad and out.grad is not None:
+                g_scalar = float(out.grad.sum())
+                # Analytic: d(tr(expm(W²)))/d(W_ij) = 2 * W_ij * expm(W²)_ij
+                contrib = 2.0 * _W.data * _expm_A * g_scalar
+                _W.grad = _W.grad + contrib if _W.grad is not None else contrib
 
-        trace_t._backward = _trace_back
-
-        dag_penalty = trace_t - float(n)
-        return dag_penalty
+        out._backward = _back
+        return out
 
     def _message_pass(self, node_states: Tensor, W_sparse: np.ndarray) -> Tensor:
         """

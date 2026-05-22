@@ -58,10 +58,25 @@ class MultiTaskHead(Module):
         recent_start = max(0, T - max(1, T // 4))
 
         # Mean pool recent timesteps
-        z_recent = z.data[:, recent_start:, :]  # (B, T', d_model)
-        z_pool = z_recent.mean(axis=1)           # (B, d_model)
+        T_recent = z.data.shape[1] - recent_start
+        z_pool_np = z.data[:, recent_start:, :].mean(axis=1)   # (B, d_model)
+        z_pooled = Tensor(
+            z_pool_np,
+            requires_grad=z.requires_grad,
+            _children=(z,),
+            _op="recent_mean_pool"
+        )
+        _z_ref = z
+        _recent_start = recent_start
+        _T_recent = T_recent
 
-        z_pooled = Tensor(z_pool, requires_grad=z.requires_grad)
+        def _pool_back():
+            if _z_ref.requires_grad and z_pooled.grad is not None:
+                contrib = np.zeros_like(_z_ref.data)
+                contrib[:, _recent_start:, :] = z_pooled.grad[:, None, :] / _T_recent
+                _z_ref.grad = _z_ref.grad + contrib if _z_ref.grad is not None else contrib
+
+        z_pooled._backward = _pool_back
 
         # Normalize
         z_n = self.norm(z_pooled)

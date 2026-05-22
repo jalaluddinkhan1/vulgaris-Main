@@ -17,13 +17,26 @@ class SpectralAdamW:
         spectral_clip: float = 2.0,
         grad_clip: float = 1.0,
     ):
-        self.params = list(params)
         self.lr = lr
         self.betas = betas
         self.eps = eps
         self.weight_decay = weight_decay
         self.spectral_clip = spectral_clip
         self.grad_clip = grad_clip
+
+        # Support both flat list and param-group list of dicts
+        params_list = list(params)
+        if params_list and isinstance(params_list[0], dict):
+            self.param_groups: list = params_list
+        else:
+            self.param_groups = [{"params": params_list, "lr": lr,
+                                   "weight_decay": weight_decay}]
+        self.params = [p for g in self.param_groups for p in g["params"]]
+        # Map id(param) -> group index for per-group lr/wd lookup
+        self._param_group_idx: dict = {}
+        for gi, g in enumerate(self.param_groups):
+            for p in g["params"]:
+                self._param_group_idx[id(p)] = gi
 
         self._t: int = 0
 
@@ -139,10 +152,13 @@ class SpectralAdamW:
             m_hat = m / bc1
             v_hat = v / bc2
 
-            # AdamW step: gradient update + decoupled weight decay
+            # AdamW step: gradient update + decoupled weight decay (per-group lr/wd)
+            gi = self._param_group_idx.get(pid, 0)
+            g_lr = self.param_groups[gi].get("lr", self.lr)
+            g_wd = self.param_groups[gi].get("weight_decay", self.weight_decay)
             update = m_hat / (np.sqrt(v_hat) + self.eps)
-            p.data -= self.lr * update
-            p.data -= self.lr * self.weight_decay * p.data
+            p.data -= g_lr * update
+            p.data -= g_lr * g_wd * p.data
 
         # Spectral norm clipping
         for p in self.params:

@@ -105,75 +105,120 @@ class SelfSupervisedTrainer:
         x_target = x_np.transpose(0, 2, 1)  # (B, T, C)
 
         # MSE only on masked positions
-        loss_val = 0.0
-        n_masked = 0
-        for b in range(B):
-            for t in range(T):
-                if mask[b, t]:
-                    diff = recon.data[b, t] - x_target[b, t]
-                    loss_val += float(np.mean(diff ** 2))
-                    n_masked += 1
-
+        mask_expanded = mask[:, :, None]                          # (B, T, 1)
+        recon_np = recon.data                                     # (B, T, C)
+        diff_np = recon_np - x_target                             # (B, T, C)
+        sq_np = diff_np ** 2                                      # (B, T, C)
+        n_masked = int(mask.sum())
         if n_masked == 0:
             return 0.0, Tensor(np.array([[0.0]], dtype=np.float32))
+        loss_scalar = float((sq_np * mask_expanded).sum()) / (n_masked * x_target.shape[2])
 
-        loss_scalar = loss_val / n_masked
-        loss_t = Tensor(np.array([[loss_scalar]], dtype=np.float32), requires_grad=False)
+        # Wrap as Tensor so backward can reach recon
+        loss_t = Tensor(
+            np.array([[loss_scalar]], dtype=np.float32),
+            requires_grad=recon.requires_grad,
+            _children=(recon,),
+            _op="masked_mse"
+        )
+        _recon = recon
+        _mask_exp = mask_expanded.astype(np.float32)
+        _n_denom = float(n_masked * x_target.shape[2])
+
+        def _masked_mse_back():
+            if _recon.requires_grad and loss_t.grad is not None:
+                g = float(loss_t.grad.sum())
+                grad_recon = 2.0 * (recon_np - x_target) * _mask_exp / _n_denom * g
+                _recon.grad = _recon.grad + grad_recon if _recon.grad is not None else grad_recon
+
+        loss_t._backward = _masked_mse_back
         return loss_scalar, loss_t
 
-    def temporal_contrastive_loss(self, x_np: np.ndarray) -> float:
+    def temporal_contrastive_loss(self, x_np: np.ndarray):
         """
-        InfoNCE between anchor (t) and positive (t + delta, delta <= pos_window).
-        Negatives: all other timesteps in batch.
-        x_np: (B, C, T)
-        Returns scalar loss.
+        InfoNCE between anchor (t) and a nearby positive (t+delta).
+        Returns (scalar_float, loss_Tensor) so gradients can flow back.
         """
+        from engine.tensor import Tensor
         B, C, T = x_np.shape
         if T < self.contrastive_pos_window + 2:
-            return 0.0
+            return 0.0, Tensor(np.array([[0.0]], dtype=np.float32))
 
         x_t = Tensor(x_np.astype(np.float32), requires_grad=False)
         _, aux = self.model(x_t, domain_idx=0)
-        z = aux.get("h_states")  # (B, T, d_model)
-
-        if z is None:
-            return 0.0
+        z = aux.get("h_states")  # (B, T, d_model) — Tensor, requires_grad=True through params
+        if z is None or not z.requires_grad:
+            return 0.0, Tensor(np.array([[0.0]], dtype=np.float32))
 
         z_np = z.data  # (B, T, d_model)
 
-        total_loss = 0.0
-        count = 0
+        # Sample one (anchor, positive) pair per batch item
+        t_anchors = np.random.randint(0, T - self.contrastive_pos_window - 1, size=B)
+        deltas    = np.random.randint(1, self.contrastive_pos_window + 1, size=B)
+        t_pos_arr = t_anchors + deltas
 
-        for b in range(B):
-            # Sample anchor timestep
-            t_anchor = np.random.randint(0, T - self.contrastive_pos_window - 1)
-            delta = np.random.randint(1, self.contrastive_pos_window + 1)
-            t_pos = t_anchor + delta
+        # Normalize all embeddings: (B, T, d_model)
+        eps = 1e-8
+        norms = np.linalg.norm(z_np, axis=-1, keepdims=True) + eps
+        z_norm = z_np / norms   # (B, T, d_model)
 
-            anchor = z_np[b, t_anchor]  # (d_model,)
-            positive = z_np[b, t_pos]   # (d_model,)
+        # Build anchor embeddings (B, d_model)
+        anchors_np = np.array([z_norm[b, t_anchors[b]] for b in range(B)])
 
-            # Negatives: all other timesteps from this batch item (excluding anchor, pos)
-            neg_indices = [t for t in range(T) if t != t_anchor and t != t_pos]
-            negatives = z_np[b, neg_indices]  # (n_neg, d_model)
+        # similarity scores: anchor vs all T timesteps  (B, T)
+        # sim[b, t] = dot(anchor[b], z_norm[b, t])
+        sim_np = np.einsum('bd,btd->bt', anchors_np, z_norm) / self.contrastive_temp
 
-            # Normalize
-            eps = 1e-8
-            anchor = anchor / (np.linalg.norm(anchor) + eps)
-            positive = positive / (np.linalg.norm(positive) + eps)
-            negatives = negatives / (np.linalg.norm(negatives, axis=1, keepdims=True) + eps)
+        # InfoNCE: -log(exp(sim_pos) / sum_t exp(sim))  per batch item
+        sim_pos_np  = np.array([sim_np[b, t_pos_arr[b]] for b in range(B)])  # (B,)
+        log_sum_exp = np.log(np.sum(np.exp(sim_np - sim_np.max(axis=-1, keepdims=True)),
+                                    axis=-1) + eps) + sim_np.max(axis=-1)       # (B,)
+        per_item    = -(sim_pos_np - log_sum_exp)                               # (B,)
+        loss_scalar = float(per_item.mean())
 
-            sim_pos = np.dot(anchor, positive) / self.contrastive_temp
-            sim_neg = (negatives @ anchor) / self.contrastive_temp
+        # Wrap as Tensor with gradient flowing back through z
+        loss_t = Tensor(
+            np.array([[loss_scalar]], dtype=np.float32),
+            requires_grad=z.requires_grad,
+            _children=(z,),
+            _op="infonce"
+        )
 
-            # InfoNCE: -log(exp(pos) / (exp(pos) + sum(exp(neg))))
-            sim_all = np.concatenate([[sim_pos], sim_neg])
-            log_sum_exp = np.log(np.sum(np.exp(sim_all - sim_all.max())) + eps) + sim_all.max()
-            loss_b = -(sim_pos - log_sum_exp)
-            total_loss += float(loss_b)
-            count += 1
+        _z = z; _sim_np = sim_np; _z_norm = z_norm; _norms = norms
+        _anchors_np = anchors_np; _t_anchors = t_anchors; _t_pos_arr = t_pos_arr
+        _temp = self.contrastive_temp
 
-        return total_loss / max(count, 1)
+        def _infonce_back():
+            if not _z.requires_grad or loss_t.grad is None:
+                return
+            g = float(loss_t.grad.sum()) / B
+            # softmax over time for each batch item
+            shifted = _sim_np - _sim_np.max(axis=-1, keepdims=True)
+            exp_sim = np.exp(shifted)
+            softmax_t = exp_sim / (exp_sim.sum(axis=-1, keepdims=True) + 1e-8)  # (B, T)
+
+            # d(loss)/d(sim[b,t]) = softmax[b,t] - 1{t==t_pos[b]}
+            d_sim = softmax_t.copy()  # (B, T)
+            for b in range(B):
+                d_sim[b, _t_pos_arr[b]] -= 1.0
+
+            # d(sim[b,t])/d(z_norm[b,t2,d]) = anchor[b,d]/temp * 1{t2==t}
+            # We need d(loss)/d(z.data[b, t, d])
+            # sim[b,t] = sum_d anchor[b,d] * z_norm[b,t,d] / temp
+            # so d(sim[b,t])/d(z[b,t,d]) ≈ anchor[b,d] / (norms[b,t]*temp)  (approx, ignore norm grad)
+            contrib = np.zeros_like(_z.data)
+            for b in range(B):
+                # gradient from z_norm contribution as "keys"
+                contrib[b] += (d_sim[b, :, None] * _anchors_np[b:b+1, :]) / (_norms[b] * _temp)
+                # gradient from anchor contribution (anchor at t_anchors[b])
+                d_anchor = (d_sim[b] @ _z_norm[b]) / _temp    # (d_model,)
+                contrib[b, _t_anchors[b]] += d_anchor / (_norms[b, _t_anchors[b], 0] + 1e-8)
+
+            contrib *= g
+            _z.grad = _z.grad + contrib if _z.grad is not None else contrib
+
+        loss_t._backward = _infonce_back
+        return loss_scalar, loss_t
 
     def pretrain_step(self, x_np: np.ndarray) -> dict:
         """

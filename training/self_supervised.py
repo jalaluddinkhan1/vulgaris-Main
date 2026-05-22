@@ -268,27 +268,192 @@ class SelfSupervisedTrainer:
 
     def pretrain_step(self, x_np: np.ndarray) -> dict:
         """
-        Run one pretraining step combining both objectives.
+        Run one pretraining step combining masked reconstruction + temporal contrastive.
         x_np: (B, C, T) numpy float32
         Returns dict of losses.
         """
         self.model.train()
         self._zero_grad()
 
-        recon_loss, recon_tensor = self.masked_reconstruction_loss(x_np)
-        contrastive_loss = self.temporal_contrastive_loss(x_np)
+        recon_scalar, recon_t = self.masked_reconstruction_loss(x_np)
+        cont_scalar, cont_t = self.temporal_contrastive_loss(x_np)
 
-        # Simple gradient step on reconstruction (contrastive is numpy-only)
-        # For a full implementation, contrastive would also flow gradients
-        if recon_loss > 0 and recon_tensor.data.item() > 0:
-            recon_tensor.backward()
-            self._sgd_step()
+        total = recon_scalar + cont_scalar
+
+        # Backward through both objectives
+        if recon_scalar > 0:
+            recon_t.backward()
+        if cont_scalar > 0:
+            cont_t.backward()
+
+        if total > 0:
+            self._opt_step()
 
         self._step += 1
-
         return {
-            "recon_loss": recon_loss,
-            "contrastive_loss": contrastive_loss,
-            "total_pretrain_loss": recon_loss + contrastive_loss,
+            "recon_loss": recon_scalar,
+            "contrastive_loss": cont_scalar,
+            "total_pretrain_loss": total,
             "step": self._step,
         }
+
+    def forecast_pretrain_step(self, x_np: np.ndarray, horizon: Optional[int] = None) -> dict:
+        """
+        Forecasting pretraining: given context [0, T-H), predict [T-H, T).
+
+        x_np  : (B, C, T) float32 — full window including the target horizon
+        horizon: if None, uses self.forecast_horizon
+        Returns dict with 'forecast_loss' and 'step'.
+        """
+        H = horizon if horizon is not None else self.forecast_horizon
+        B, C, T = x_np.shape
+        if T <= H:
+            return {"forecast_loss": 0.0, "step": self._step}
+
+        T_ctx = T - H
+        x_ctx = x_np[:, :, :T_ctx]          # (B, C, T_ctx) — input to encoder
+        x_tgt = x_np[:, :, T_ctx:]          # (B, C, H)     — ground truth
+
+        self.model.train()
+        self._zero_grad()
+
+        x_t = Tensor(x_ctx.astype(np.float32), requires_grad=False)
+        _, aux = self.model(x_t, domain_idx=0)
+        z = aux.get("h_states")              # (B, T_ctx, d_model)
+
+        if z is None:
+            return {"forecast_loss": 0.0, "step": self._step}
+
+        # Temporarily resize forecast head if horizon changed at runtime
+        if H != self.forecast_head.horizon:
+            from engine.layers import Linear as _Lin
+            self.forecast_head.horizon = H
+            self.forecast_head.proj = _Lin(self.d_model, H * self.in_channels)
+            # refresh param list
+            self._params = (
+                list(self.model.parameters())
+                + list(self.recon_head.parameters())
+                + list(self.forecast_head.parameters())
+            )
+            self._optimizer = None
+
+        pred = self.forecast_head(z)         # (B, H, C)
+
+        # Target: (B, H, C)
+        x_tgt_t = x_tgt.transpose(0, 2, 1)  # (B, H, C)
+        pred_np = pred.data
+        diff_np = pred_np - x_tgt_t
+        loss_scalar = float((diff_np ** 2).mean())
+
+        loss_t = Tensor(
+            np.array([[loss_scalar]], dtype=np.float32),
+            requires_grad=pred.requires_grad,
+            _children=(pred,),
+            _op="forecast_mse"
+        )
+        _pred = pred
+        _denom = float(B * H * C)
+
+        def _fcast_back():
+            if _pred.requires_grad and loss_t.grad is not None:
+                g = float(loss_t.grad.sum())
+                _pred.grad = (
+                    (_pred.grad + 2.0 * diff_np / _denom * g)
+                    if _pred.grad is not None
+                    else (2.0 * diff_np / _denom * g).astype(np.float32)
+                )
+
+        loss_t._backward = _fcast_back
+
+        if loss_scalar > 0:
+            loss_t.backward()
+            self._opt_step()
+
+        self._step += 1
+        return {"forecast_loss": loss_scalar, "step": self._step}
+
+    def channel_correlation_step(self, x_np: np.ndarray) -> dict:
+        """
+        Channel correlation pretraining: predict which channel pairs are correlated.
+
+        For each batch item, compute the empirical correlation matrix C (C×C),
+        then train the model to reconstruct C from the mean latent z̄ (d_model).
+        This forces the encoder to capture inter-channel relationships.
+
+        x_np: (B, C, T) float32
+        Returns dict with 'corr_loss'.
+        """
+        B, C_ch, T = x_np.shape
+
+        # Empirical correlation targets: (B, C, C)
+        targets = np.zeros((B, C_ch, C_ch), dtype=np.float32)
+        for b in range(B):
+            x_b = x_np[b]                            # (C, T)
+            mu = x_b.mean(axis=1, keepdims=True)
+            x_c = x_b - mu
+            std = x_c.std(axis=1, keepdims=True) + 1e-8
+            x_n = x_c / std
+            targets[b] = (x_n @ x_n.T) / T          # (C, C)
+
+        self.model.train()
+        self._zero_grad()
+
+        x_t = Tensor(x_np.astype(np.float32), requires_grad=False)
+        _, aux = self.model(x_t, domain_idx=0)
+        z = aux.get("h_states")                      # (B, T, d_model)
+
+        if z is None:
+            return {"corr_loss": 0.0}
+
+        # Mean-pool latent: (B, d_model)
+        z_mean_np = z.data.mean(axis=1)
+        z_mean = Tensor(
+            z_mean_np.astype(np.float32),
+            requires_grad=z.requires_grad,
+            _children=(z,),
+            _op="corr_pool"
+        )
+        _z_ref = z; _T = T
+
+        def _corr_pool_back():
+            if _z_ref.requires_grad and z_mean.grad is not None:
+                contrib = np.broadcast_to(z_mean.grad[:, None, :] / _T, _z_ref.data.shape).copy()
+                _z_ref.grad = _z_ref.grad + contrib if _z_ref.grad is not None else contrib
+
+        z_mean._backward = _corr_pool_back
+
+        # Project to C*C with a lazily-created head
+        n_pairs = C_ch * C_ch
+        if not hasattr(self, '_corr_proj') or self._corr_proj.weight.data.shape != (n_pairs, self.d_model):
+            from engine.layers import Linear as _Lin
+            self._corr_proj = _Lin(self.d_model, n_pairs)
+            self._params += list(self._corr_proj.parameters())
+            self._optimizer = None
+
+        pred_flat = self._corr_proj(z_mean)          # (B, C*C)
+        pred_corr = pred_flat.reshape(B, C_ch, C_ch) # (B, C, C)
+
+        diff = pred_corr.data - targets
+        loss_scalar = float((diff ** 2).mean())
+
+        loss_t = Tensor(
+            np.array([[loss_scalar]], dtype=np.float32),
+            requires_grad=pred_flat.requires_grad,
+            _children=(pred_flat,),
+            _op="corr_mse"
+        )
+        _pf = pred_flat; _diff = diff; _denom = float(B * C_ch * C_ch)
+
+        def _corr_back():
+            if _pf.requires_grad and loss_t.grad is not None:
+                g = float(loss_t.grad.sum())
+                grad_flat = (2.0 * _diff / _denom * g).reshape(B, n_pairs).astype(np.float32)
+                _pf.grad = _pf.grad + grad_flat if _pf.grad is not None else grad_flat
+
+        loss_t._backward = _corr_back
+
+        if loss_scalar > 0:
+            loss_t.backward()
+            self._opt_step()
+
+        return {"corr_loss": loss_scalar}

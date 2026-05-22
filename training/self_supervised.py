@@ -22,6 +22,43 @@ class MaskedReconstructionHead(Module):
         return out.reshape(B, T, -1)
 
 
+class ForecastHead(Module):
+    """
+    Projects the last latent step to H forecast steps across C channels.
+    Takes z (B, T, d_model) → predictions (B, H, C).
+    """
+
+    def __init__(self, d_model: int, in_channels: int, horizon: int):
+        super().__init__()
+        self.horizon = horizon
+        self.in_channels = in_channels
+        self.proj = Linear(d_model, horizon * in_channels)
+
+    def forward(self, z: Tensor) -> Tensor:
+        # Use last timestep as the summary vector
+        B, T, D = z.data.shape
+        z_last = z.reshape(B * T, D)
+
+        # Gradient-connected slice of last timestep
+        last_np = z.data[:, -1, :]   # (B, D)
+        last_t = Tensor(
+            last_np.astype(np.float32),
+            requires_grad=z.requires_grad,
+            _children=(z,),
+            _op="last_step_slice"
+        )
+        _z_ref = z
+        def _last_back():
+            if _z_ref.requires_grad and last_t.grad is not None:
+                contrib = np.zeros_like(_z_ref.data)
+                contrib[:, -1, :] = last_t.grad
+                _z_ref.grad = _z_ref.grad + contrib if _z_ref.grad is not None else contrib
+        last_t._backward = _last_back
+
+        out = self.proj(last_t)       # (B, H*C)
+        return out.reshape(B, self.horizon, self.in_channels)
+
+
 class SelfSupervisedTrainer:
     """
     Two pretraining objectives:
@@ -42,6 +79,7 @@ class SelfSupervisedTrainer:
         mask_ratio_max: float = 0.30,
         contrastive_temp: float = 0.07,
         contrastive_pos_window: int = 5,
+        forecast_horizon: int = 8,
         lr: float = 1e-3,
     ):
         self.model = model
@@ -51,22 +89,30 @@ class SelfSupervisedTrainer:
         self.mask_ratio_max = mask_ratio_max
         self.contrastive_temp = contrastive_temp
         self.contrastive_pos_window = contrastive_pos_window
+        self.forecast_horizon = forecast_horizon
 
         self.recon_head = MaskedReconstructionHead(d_model, in_channels)
+        self.forecast_head = ForecastHead(d_model, in_channels, forecast_horizon)
 
-        # Collect all parameters for simple SGD
-        self._params = list(model.parameters()) + list(self.recon_head.parameters())
+        # Collect all parameters for optimizer
+        self._params = (
+            list(model.parameters())
+            + list(self.recon_head.parameters())
+            + list(self.forecast_head.parameters())
+        )
         self.lr = lr
         self._step = 0
+        self._optimizer = None
 
     def _zero_grad(self):
         for p in self._params:
             p.grad = None
 
-    def _sgd_step(self):
-        for p in self._params:
-            if p.grad is not None:
-                p.data -= self.lr * p.grad
+    def _opt_step(self):
+        if self._optimizer is None:
+            from training.optimizer import SpectralAdamW
+            self._optimizer = SpectralAdamW(self._params, lr=self.lr)
+        self._optimizer.step()
 
     def _make_mask(self, B: int, T: int) -> np.ndarray:
         """Boolean mask (B, T): True = masked position."""

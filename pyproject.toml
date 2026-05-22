@@ -68,6 +68,8 @@ all = [
     "rich>=13.6",
 ]
 
+
+#chage this to vularis when when you push in pypi
 [project.urls]
 Homepage      = "https://github.com/jalaluddinkhan1/vulgaris-Main"
 Documentation = "https://github.com/jalaluddinkhan1/vulgaris-Main#readme"

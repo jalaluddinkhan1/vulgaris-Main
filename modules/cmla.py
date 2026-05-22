@@ -303,8 +303,6 @@ class CrossModalLatentAlignment(Module):
                     g_slice = g_slice.reshape(z_m.shape)                      # (B, T, D)
                     z_m.grad = z_m.grad + g_slice if z_m.grad is not None else g_slice
 
-        # Capture N in closure
-        _N = N
         loss_t._backward = _infonce_back
 
         return loss_t

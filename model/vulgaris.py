@@ -16,6 +16,7 @@ from modules.ese import ExplainabilityEngine
 from modules.cmla import CrossModalLatentAlignment
 from modules.htd import HierarchicalTimescaleDecomposition
 from modules.safety import SafetyPolicyHead
+from modules.icl import InContextLearning
 from config import ModelConfig
 
 
@@ -100,6 +101,14 @@ class Vulgaris(Module):
         # ── Causal attention (post-SSSR, pre-CRG) ─────────────────────────
         self.attn = CausalAttention(d_model=d_model, n_heads=max(1, d_model // 64))
 
+        # ── In-Context Learning adapter ────────────────────────────────────
+        output_or_classes = config.n_classes if config.n_classes > 0 else config.output_dim
+        self.icl = InContextLearning(
+            d_model=d_model,
+            output_dim=output_or_classes,
+            n_heads=max(1, d_model // 64),
+        )
+
         self.crg = CausalRoutingGraph(d_model=d_model, config=config.crg)
 
         self.hmb = HierarchicalMemoryBank(config=config.hmb)
@@ -179,9 +188,16 @@ class Vulgaris(Module):
         timestamps: Optional[Tensor] = None,
         use_safety: bool = False,
         mask: Optional[np.ndarray] = None,
+        context: Optional[List[tuple]] = None,
     ) -> Tuple[Tensor, dict]:
         """
-        x: (batch, in_channels, T) or List[Tensor] for multi-modal
+        x       : (batch, in_channels, T) or List[Tensor] for multi-modal
+        context : optional list of (x_ref, y_ref) pairs for zero-shot in-context
+                  adaptation. Each x_ref is (B, C, T_ref) numpy or Tensor;
+                  y_ref is (B, output_dim) numpy or Tensor.
+                  Example::
+                      context = [(x_ref1, y_ref1), (x_ref2, y_ref2)]
+                      output, aux = model(x_query, context=context)
         Returns (output, aux_losses).
         """
         aux_losses: dict = {}
@@ -243,6 +259,25 @@ class Vulgaris(Module):
         # ── Causal Attention ─────────────────────────────────────────────
         z_attn = self.attn(z)
         z = z + z_attn
+
+        # ── In-Context Learning (zero-shot conditioning) ──────────────────
+        if context is not None and len(context) > 0:
+            ctx_latents, ctx_labels = [], []
+            for x_ref, y_ref in context:
+                if not isinstance(x_ref, Tensor):
+                    x_ref = Tensor(np.asarray(x_ref, dtype=np.float32))
+                if not isinstance(y_ref, Tensor):
+                    y_ref = Tensor(np.asarray(y_ref, dtype=np.float32))
+                x_ref_norm = self.revin.normalize(x_ref)
+                z_ref = self.ase(x_ref_norm)          # (B, T_ref, d_model)
+                ctx_latents.append(z_ref)
+                ctx_labels.append(y_ref)
+            ctx_stack = self.icl.encode_context(ctx_latents, ctx_labels)
+            z_icl = self.icl(z, ctx_stack)
+            z = z + z_icl
+            aux_losses["icl_active"] = True
+        else:
+            aux_losses["icl_active"] = False
 
         # ── DAH: apply domain adapter as residual on SSM output ───────────
         # skip_proj maps d_model→d_model so its adapter is shape-compatible with z

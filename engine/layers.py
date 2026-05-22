@@ -552,3 +552,104 @@ class RevIN(Module):
     def __repr__(self) -> str:
         return (f"RevIN(num_features={self.num_features}, eps={self.eps}, "
                 f"affine={self.affine})")
+
+
+class CrossAttention(Module):
+    """Multi-head cross-attention: query attends to external key/value context.
+
+    No causal mask — every query position can attend to every context position.
+
+    Parameters
+    ----------
+    d_model  : query and output dimension
+    n_heads  : number of attention heads
+    """
+
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.scale = 1.0 / _math.sqrt(self.head_dim)
+
+        self.q_proj   = Linear(d_model, d_model, bias=False)
+        self.k_proj   = Linear(d_model, d_model, bias=False)
+        self.v_proj   = Linear(d_model, d_model, bias=False)
+        self.out_proj = Linear(d_model, d_model, bias=True)
+        self.norm_q   = RMSNorm(d_model)
+        self.norm_ctx = RMSNorm(d_model)
+
+    def forward(self, query: Tensor, context: Tensor) -> Tensor:
+        """
+        query   : (B, T_q, d_model)
+        context : (B, T_ctx, d_model)
+        Returns : (B, T_q, d_model)
+        """
+        B, T_q, _ = query.data.shape
+        T_ctx = context.data.shape[1]
+        nh = self.n_heads
+        hd = self.head_dim
+        scale = self.scale
+
+        # Pre-norm
+        q_n = self.norm_q(query)
+        c_n = self.norm_ctx(context)
+
+        Q = self.q_proj(q_n)    # (B, T_q,   d_model)
+        K = self.k_proj(c_n)    # (B, T_ctx, d_model)
+        V = self.v_proj(c_n)    # (B, T_ctx, d_model)
+
+        # Reshape to (B, nh, T, hd)
+        q_np = Q.data.reshape(B, T_q,   nh, hd).transpose(0, 2, 1, 3)
+        k_np = K.data.reshape(B, T_ctx, nh, hd).transpose(0, 2, 1, 3)
+        v_np = V.data.reshape(B, T_ctx, nh, hd).transpose(0, 2, 1, 3)
+
+        # Scaled dot-product  (B, nh, T_q, T_ctx)
+        scores_np = q_np @ k_np.transpose(0, 1, 3, 2) * scale
+
+        # Softmax over context positions
+        scores_np -= scores_np.max(axis=-1, keepdims=True)
+        exp_s  = np.exp(scores_np)
+        attn_np = exp_s / (exp_s.sum(axis=-1, keepdims=True) + 1e-8)
+
+        # Weighted sum  (B, nh, T_q, hd)
+        out_np = attn_np @ v_np
+        out_np = out_np.transpose(0, 2, 1, 3).reshape(B, T_q, nh * hd).astype(np.float32)
+
+        requires_grad = Q.requires_grad or K.requires_grad or V.requires_grad
+        out_t = Tensor(out_np, requires_grad=requires_grad,
+                       _children=(Q, K, V), _op="cross_attn")
+
+        _attn = attn_np; _q_np = q_np; _k_np = k_np; _v_np = v_np
+        _B, _Tq, _Tc, _nh, _hd, _sc = B, T_q, T_ctx, nh, hd, scale
+
+        def _back():
+            g = out_t.grad if out_t.grad is not None else np.ones(out_np.shape, np.float32)
+            g_out = g.reshape(_B, _Tq, _nh, _hd).transpose(0, 2, 1, 3)  # (B, nh, Tq, hd)
+
+            dV_np = _attn.transpose(0, 1, 3, 2) @ g_out                  # (B, nh, Tc, hd)
+            dA_np = g_out @ _v_np.transpose(0, 1, 3, 2)                   # (B, nh, Tq, Tc)
+            dS_np = _attn * (dA_np - (dA_np * _attn).sum(axis=-1, keepdims=True))
+            dS_np = dS_np * _sc
+
+            dQ_np = dS_np @ _k_np                                          # (B, nh, Tq, hd)
+            dK_np = dS_np.transpose(0, 1, 3, 2) @ _q_np                   # (B, nh, Tc, hd)
+
+            dQ_flat = dQ_np.transpose(0,2,1,3).reshape(_B,_Tq,_nh*_hd).astype(np.float32)
+            dK_flat = dK_np.transpose(0,2,1,3).reshape(_B,_Tc,_nh*_hd).astype(np.float32)
+            dV_flat = dV_np.transpose(0,2,1,3).reshape(_B,_Tc,_nh*_hd).astype(np.float32)
+
+            if Q.requires_grad:
+                Q.grad = (Q.grad + dQ_flat) if Q.grad is not None else dQ_flat
+            if K.requires_grad:
+                K.grad = (K.grad + dK_flat) if K.grad is not None else dK_flat
+            if V.requires_grad:
+                V.grad = (V.grad + dV_flat) if V.grad is not None else dV_flat
+
+        out_t._backward = _back
+        return self.out_proj(out_t)
+
+    def __repr__(self) -> str:
+        return (f"CrossAttention(d_model={self.d_model}, n_heads={self.n_heads}, "
+                f"n_params={self.n_params():,})")

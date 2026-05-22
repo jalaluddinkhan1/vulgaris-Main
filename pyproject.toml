@@ -1,0 +1,131 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project metadata
+# ─────────────────────────────────────────────────────────────────────────────
+[project]
+name        = "vulgaris"
+version     = "0.1.3"
+description = "Foundational industrial AI model for real-time telemetry, IoT, and time-series"
+readme      = "README.md"
+license     = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+
+keywords = [
+    "machine-learning", "deep-learning", "time-series",
+    "industrial-ai", "telemetry", "iot", "streaming",
+    "state-space-model", "autograd", "numpy",
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+serve = [
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "pydantic>=2.4",
+]
+train = [
+    "tqdm>=4.66",
+    "rich>=13.6",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-timeout>=2.2",
+    "pytest-cov>=4.1",
+    "black>=23.9",
+    "ruff>=0.1",
+    "mypy>=1.6",
+    "build>=1.0",
+    "twine>=4.0",
+]
+all = [
+    "fastapi>=0.104",
+    "uvicorn[standard]>=0.24",
+    "pydantic>=2.4",
+    "tqdm>=4.66",
+    "rich>=13.6",
+]
+
+[project.urls]
+Homepage      = "https://github.com/jalaluddinkhan1/vulgaris-Main"
+Documentation = "https://github.com/jalaluddinkhan1/vulgaris-Main#readme"
+Repository    = "https://github.com/jalaluddinkhan1/vulgaris-Main"
+"Bug Tracker" = "https://github.com/jalaluddinkhan1/vulgaris-Main/issues"
+
+[project.scripts]
+vulgaris-serve = "inference.server_entrypoint:main"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Package discovery
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.setuptools]
+py-modules = ["config"]
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = [
+    "vulgaris*",
+    "engine*",
+    "modules*",
+    "model*",
+    "training*",
+    "inference*",
+    "serve*",
+    "monitoring*",
+    "federated*",
+    "benchmarks*",
+]
+exclude = ["tests*", "deploy*", "checkpoints*", "*.egg-info"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool config
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.black]
+line-length    = 100
+target-version = ["py310", "py311"]
+
+[tool.ruff]
+line-length = 100
+select      = ["E", "F", "W", "I"]
+ignore      = ["E501", "F401"]
+
+[tool.mypy]
+python_version         = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores    = false
+
+[tool.pytest.ini_options]
+testpaths    = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["engine", "modules", "model", "training", "vulgaris"]
+omit   = ["tests/*", "benchmarks/*", "deploy/*"]

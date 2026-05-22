@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  vulgaris:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - VULGARIS_INPUT_DIM=9
+      - VULGARIS_N_CLASSES=5
+      - VULGARIS_D_MODEL=64
+      - VULGARIS_API_KEYS=${VULGARIS_API_KEYS:-}
+      - VULGARIS_LOG_LEVEL=INFO
+      - VULGARIS_CHECKPOINT=${VULGARIS_CHECKPOINT:-}
+      - VULGARIS_PORT=8000
+    mem_limit: 2g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    volumes:
+      - ./checkpoints:/app/checkpoints
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    mem_limit: 512m
+    restart: unless-stopped

@@ -1,0 +1,18 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include engine *.py
+recursive-include modules *.py
+recursive-include model *.py
+recursive-include training *.py
+recursive-include inference *.py
+recursive-include serve *.py
+recursive-include monitoring *.py
+recursive-include federated *.py
+recursive-include benchmarks *.py
+recursive-include vulgaris *.py
+include config.py
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store

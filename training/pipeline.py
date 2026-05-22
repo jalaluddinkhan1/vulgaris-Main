@@ -9,6 +9,116 @@ from .loss import VulgarisLoss
 from .optimizer import SpectralAdamW, CosineSchedule
 
 
+class TimeSeriesAugment:
+    """
+    Lightweight time-series augmentations applied to (B, C, T) numpy arrays.
+    Each augmentation fires independently with probability `aug_prob`.
+
+    Parameters
+    ----------
+    noise_std          : std of additive Gaussian noise
+    channel_dropout_p  : probability of zeroing an entire channel per batch item
+    scale_range        : (lo, hi) uniform magnitude scaling per channel
+    time_warp_max      : max timesteps to shift/roll signal (0 to disable)
+    aug_prob           : probability each augmentation fires per call
+    """
+
+    def __init__(
+        self,
+        noise_std: float = 0.01,
+        channel_dropout_p: float = 0.1,
+        scale_range: tuple = (0.8, 1.2),
+        time_warp_max: int = 4,
+        aug_prob: float = 0.5,
+    ):
+        self.noise_std = noise_std
+        self.channel_dropout_p = channel_dropout_p
+        self.scale_range = scale_range
+        self.time_warp_max = time_warp_max
+        self.aug_prob = aug_prob
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        """x: (B, C, T) float32.  Returns augmented copy."""
+        x = x.copy()
+
+        # Gaussian noise
+        if self.noise_std > 0 and np.random.rand() < self.aug_prob:
+            x += np.random.randn(*x.shape).astype(np.float32) * self.noise_std
+
+        # Channel dropout: zero out random channels per batch item
+        if self.channel_dropout_p > 0 and np.random.rand() < self.aug_prob:
+            for b in range(x.shape[0]):
+                drop = np.random.rand(x.shape[1]) < self.channel_dropout_p
+                x[b, drop, :] = 0.0
+
+        # Magnitude scaling per channel per batch item
+        if np.random.rand() < self.aug_prob:
+            lo, hi = self.scale_range
+            scales = np.random.uniform(lo, hi,
+                                       (x.shape[0], x.shape[1], 1)).astype(np.float32)
+            x *= scales
+
+        # Time warping: random circular roll of the time axis per batch item
+        if self.time_warp_max > 0 and np.random.rand() < self.aug_prob:
+            for b in range(x.shape[0]):
+                shift = np.random.randint(-self.time_warp_max, self.time_warp_max + 1)
+                if shift != 0:
+                    x[b] = np.roll(x[b], shift, axis=-1)
+
+        return x
+
+    def __repr__(self) -> str:
+        return (f"TimeSeriesAugment(noise_std={self.noise_std}, "
+                f"channel_dropout_p={self.channel_dropout_p}, "
+                f"scale_range={self.scale_range}, aug_prob={self.aug_prob})")
+
+
+class CurriculumSchedule:
+    """
+    Linearly increases the training sequence length from `t_min` to `t_max`
+    over the first `warmup_frac` fraction of total training steps.
+
+    After warmup, always returns `t_max`.
+
+    Parameters
+    ----------
+    t_min        : starting sequence length (e.g. T // 4)
+    t_max        : full sequence length
+    total_steps  : total number of training steps planned
+    warmup_frac  : fraction of total_steps used for curriculum warmup (default 0.3)
+
+    Usage
+    -----
+    curriculum = CurriculumSchedule(t_min=16, t_max=64, total_steps=10000)
+    seq_len = curriculum.get(current_step)   # int
+    x_crop = x[:, :, :seq_len]
+    """
+
+    def __init__(
+        self,
+        t_min: int,
+        t_max: int,
+        total_steps: int,
+        warmup_frac: float = 0.3,
+    ):
+        self.t_min = t_min
+        self.t_max = t_max
+        self.total_steps = total_steps
+        self.warmup_steps = max(1, int(total_steps * warmup_frac))
+
+    def get(self, step: int) -> int:
+        """Return sequence length for this training step."""
+        if step >= self.warmup_steps:
+            return self.t_max
+        progress = step / self.warmup_steps          # 0 → 1
+        length = self.t_min + int((self.t_max - self.t_min) * progress)
+        return max(self.t_min, min(length, self.t_max))
+
+    def __repr__(self) -> str:
+        return (f"CurriculumSchedule(t_min={self.t_min}, t_max={self.t_max}, "
+                f"warmup_steps={self.warmup_steps})")
+
+
 class TrainingPipeline:
     """
     Complete training loop with checkpointing, logging, and online adaptation.
@@ -21,6 +131,8 @@ class TrainingPipeline:
         loss_fn: VulgarisLoss,
         optimizer: SpectralAdamW,
         scheduler: CosineSchedule,
+        augment: Optional[TimeSeriesAugment] = None,
+        curriculum: Optional[CurriculumSchedule] = None,
     ):
         self.model = model
         self.config = config
@@ -30,6 +142,8 @@ class TrainingPipeline:
 
         self.step_count: int = 0
         self.best_loss: float = float('inf')
+        self.augment = augment
+        self.curriculum = curriculum
 
         checkpoint_dir = getattr(config.training, "checkpoint_dir", "checkpoints")
         self.checkpoint_dir: str = checkpoint_dir
@@ -61,6 +175,15 @@ class TrainingPipeline:
         """
         self.model.train()
         self.optimizer.zero_grad()
+
+        # Curriculum: crop sequence to scheduled length
+        if self.curriculum is not None:
+            seq_len = self.curriculum.get(self.step_count)
+            x = x[:, :, :seq_len]
+
+        # Augmentation: apply stochastic transforms to input
+        if self.augment is not None:
+            x = self.augment(x)
 
         x_t = Tensor(x.astype(np.float32), requires_grad=False)
         y_t = Tensor(y.astype(np.float32), requires_grad=False)

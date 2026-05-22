@@ -32,7 +32,8 @@ def _tiny_config():
     cfg.sssr.d_inner = 32
     cfg.crg.n_nodes = 4
     cfg.hmb.n_slots = 4
-    cfg.hmb.latent_dim = 16
+    cfg.hmb.embed_dim = 16
+    cfg.hmb.compress_dim = 8
     return cfg
 
 
@@ -191,10 +192,11 @@ class TestNumericalGradients(unittest.TestCase):
         Runs autograd backward once, then computes FD gradient.
         Asserts relative error < tol (lenient since float32).
         """
-        # Analytical
+        # Analytical — seed grad as all-ones so backward reduces to sum
         param_tensor.grad = None
         loss = fn_build()
-        loss.backward()
+        ones_seed = np.ones_like(loss.data)
+        loss.backward(ones_seed)
         analytical = param_tensor.grad.copy() if param_tensor.grad is not None else np.zeros_like(param_tensor.data)
 
         # Numerical — rebuild graph each call to avoid stale backward state
@@ -247,7 +249,7 @@ class TestNumericalGradients(unittest.TestCase):
             out = attn(x)
             return out.reshape(1, -1)
 
-        self._check(_fn, attn.W_q.weight, tol=0.1)
+        self._check(_fn, attn.q_proj.weight, tol=0.1)
 
     def test_masked_reconstruction_mse_grad(self):
         """Masked MSE loss backward vs finite differences on recon output."""

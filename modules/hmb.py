@@ -308,9 +308,10 @@ class HierarchicalMemoryBank(Module):
                 q_norm2 = _q_np / (np.linalg.norm(_q_np, axis=1, keepdims=True) + 1e-8)
                 c_norm2 = _cands / (np.linalg.norm(_cands, axis=1, keepdims=True) + 1e-8)
                 d_q = d_sim @ c_norm2                          # (B, D)
-                # Chain through normalization: d/dx (x/||x||) ≈ I/||x||
+                # Full Jacobian of L2 normalisation: d/dq (q/||q||) = (I - q̂q̂ᵀ) / ||q||
                 q_norms = np.linalg.norm(_q_np, axis=1, keepdims=True) + 1e-8
-                d_q_raw = d_q / q_norms
+                q_hat = _q_np / q_norms                        # (B, D)
+                d_q_raw = (d_q - (d_q * q_hat).sum(axis=1, keepdims=True) * q_hat) / q_norms
                 h_query.grad = (h_query.grad + d_q_raw
                                 if h_query.grad is not None else d_q_raw)
 

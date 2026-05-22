@@ -258,6 +258,7 @@ class CrossModalLatentAlignment(Module):
         _N_valid = valid.sum()
         _BT = BT
         _M = M
+        _N = N
 
         def _infonce_back():
             if not rg or loss_t.grad is None:

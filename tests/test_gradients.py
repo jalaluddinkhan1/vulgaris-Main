@@ -155,11 +155,12 @@ class TestGradientFlow(unittest.TestCase):
         """MultitaskHead mean-pool fix: gradient must reach pre-pool latent."""
         from modules.multitask_head import MultiTaskHead
         d_model = 16
-        head = MultiTaskHead(d_model=d_model, task_dims={"y": 1})
+        head = MultiTaskHead(d_model=d_model, n_classes=2, forecast_horizon=4, n_channels=1)
         B, T = 2, 8
         z_np = np.random.randn(B, T, d_model).astype(np.float32)
         z = Tensor(z_np, requires_grad=True)
-        out = head(z)["y"]
+        forecast, anomaly, _cls, _unc = head(z)
+        out = anomaly   # (B, 1) scalar per batch item
         target = np.zeros_like(out.data)
         diff = out.data - target
         loss = Tensor(

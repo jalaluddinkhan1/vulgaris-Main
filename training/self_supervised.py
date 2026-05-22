@@ -1,4 +1,4 @@
-"""Self-supervised pretraining for VULGARIS: masked reconstruction + temporal contrastive."""
+"""Self-supervised pretraining for VULGARIS: masked reconstruction + temporal contrastive + forecasting."""
 import numpy as np
 from typing import Optional, Tuple
 

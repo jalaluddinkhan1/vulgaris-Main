@@ -7,12 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy source
+# Copy source and install package with server dependencies
 COPY . .
+RUN pip install --no-cache-dir ".[serve]"
 
 # Environment
 ENV VULGARIS_INPUT_DIM=9

@@ -193,27 +193,15 @@ class AdaptiveSignalEmbedding(Module):
 
         fl = self.filter_len
         scale_outputs = []
+        kernels_2d = kernels_1ch[:, 0, :]  # (n_filters, fl) — squeeze 1-channel dim
+
+        from engine.fft_conv import fft_conv1d
 
         for s in range(self.n_scales):
             dilation = 2 ** s
-            # "same" output padding for causal-aware same-length output
-            # Effective kernel size: (fl - 1) * dilation + 1
-            k_eff = (fl - 1) * dilation + 1
-            padding = dilation * (fl // 2)
-
-            # Apply each filter independently: depthwise over n_filters channels
-            # We treat the n_filters channels as groups=n_filters
-            # kernel shape needed: (n_filters, 1, fl) for groups=n_filters input
-            # x_mixed: (B, n_filters, T) -- already one channel per filter group
-            out_s = self._dilated_conv1d(x_mixed, kernels_1ch, dilation, padding)
-            # out_s: (B, n_filters, T_out)  — T_out may differ slightly, crop/pad to T
-            T_out = out_s.shape[2]
-            if T_out > T:
-                out_s = out_s[:, :, :T]
-            elif T_out < T:
-                out_s = np.pad(out_s, ((0, 0), (0, 0), (0, T - T_out)), mode="constant")
-
-            scale_outputs.append(out_s)  # (B, n_filters, T)
+            # FFT conv: O(T log T) vs O(T*K) direct; 'same' length maintained internally
+            out_s = fft_conv1d(x_mixed, kernels_2d, dilation=dilation)  # (B, n_filters, T)
+            scale_outputs.append(out_s)
 
         # Concatenate scales: (B, n_scales * n_filters, T)
         multi_scale = np.concatenate(scale_outputs, axis=1)  # (B, total_ch, T)
@@ -241,6 +229,8 @@ class AdaptiveSignalEmbedding(Module):
         _x_np = x_np.copy()
         _cm_data = cm.copy()
         _kernels = kernels_1ch.copy()
+        _kernels_2d = kernels_2d.copy()
+        _x_mixed = x_mixed.copy()
         _scale_outs = [s.copy() for s in scale_outputs]
         _multi_scale = multi_scale.copy()
         _T = T

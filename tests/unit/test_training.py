@@ -21,7 +21,8 @@ def _small_config():
     cfg.sssr.d_inner = 64
     cfg.crg.n_nodes = 4
     cfg.hmb.n_slots = 8
-    cfg.hmb.latent_dim = 32
+    cfg.hmb.embed_dim = 32
+    cfg.hmb.compress_dim = 8
     return cfg
 
 

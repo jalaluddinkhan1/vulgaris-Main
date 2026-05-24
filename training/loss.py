@@ -14,7 +14,7 @@ class VulgarisLoss(Module):
       + ζ*L_cbf + η*L_temporal + θ*L_contrastive
     """
 
-    def __init__(self, config, task: str = 'regression'):
+    def __init__(self, config, task: str = None):
         super().__init__()
         self.task = task
 

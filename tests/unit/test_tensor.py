@@ -19,7 +19,7 @@ def check_grad(fn, inputs, eps=1e-4, rtol=1e-2, atol=1e-4):
     """
     # Compute analytical gradients
     out = fn(*inputs)
-    out.backward()
+    out.backward(np.ones_like(out.data))
     analytical = [inp.grad.copy() if inp.grad is not None else np.zeros_like(inp.data)
                   for inp in inputs]
 

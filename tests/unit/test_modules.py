@@ -25,7 +25,8 @@ def _default_config(d_model=32, n_classes=3, input_dim=4):
     cfg.sssr.d_inner = d_model * 2
     cfg.crg.n_nodes = 4
     cfg.hmb.n_slots = 8
-    cfg.hmb.latent_dim = d_model
+    cfg.hmb.embed_dim = d_model
+    cfg.hmb.compress_dim = max(d_model // 4, 8)
     return cfg
 
 
@@ -80,7 +81,7 @@ class TestSSSR(unittest.TestCase):
     def test_streaming_shape(self):
         sssr = self._make_sssr(32)
         z_single = Tensor(np.random.randn(2, 1, 32).astype(np.float32))
-        out, states = sssr(z_single, states=None)
+        out, states = sssr(z_single, h_states=None)
         self.assertEqual(out.data.shape, (2, 1, 32))
 
 

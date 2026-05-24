@@ -83,34 +83,58 @@ class SSSRHead(Module):
         decay = self.log_A.exp().reshape(1, 1, self.state_dim)  # always positive
         A_t = (decay * dt * (-1.0)).exp()                        # (B, T, state_dim)
 
-        # Sequential scan storing all h_t for Hebbian update
-        h_t = h_prev
-        ys = []
-        h_all = []  # list of (B, state_dim) tensors, T entries
+        # Parallel scan — replaces sequential O(T) loop with O(T log T) work
+        from engine.parallel_scan import parallel_scan_ssm, parallel_scan_ssm_backward
 
-        for t in range(T):
-            a_t = A_t[:, t, :]   # (B, state_dim)
-            b_t = B_t[:, t, :]   # (B, state_dim)
-            c_t = C_t[:, t, :]   # (B, state_dim)
+        a_np = A_t.data.astype(np.float32)
+        b_np = B_t.data.astype(np.float32)
+        h_init_np = h_prev.data.astype(np.float32)
 
-            h_t = a_t * h_t + b_t  # h_t = A_t ⊙ h_{t-1} + B_t ⊙ x_t
-            h_all.append(h_t)
+        h_np = parallel_scan_ssm(a_np, b_np, h_init_np)  # (B, T, state_dim)
 
-            # y_t = C_t · h_t + D ⊙ x_t  (dot then add skip)
-            y_t = (c_t * h_t).sum(axis=-1, keepdims=True)  # (B, 1)
-            # Add D ⊙ x_t contribution: D is per d_model but y_t is scalar per head
-            # We sum D⊙x over d_model to produce scalar skip
-            x_t_raw = x[:, t, :]                  # (B, d_model)
-            skip = (self.D * x_t_raw).sum(axis=-1, keepdims=True)  # (B, 1)
-            y_t = y_t + skip                       # (B, 1)
-            ys.append(y_t.unsqueeze(1))            # (B, 1, 1)
+        # Wrap as Tensor so downstream ops stay in the autograd graph
+        h_all = Tensor(
+            h_np,
+            requires_grad=A_t.requires_grad or B_t.requires_grad,
+            _children=(A_t, B_t),
+            _op="parallel_scan"
+        )
+        _A_t, _B_t, _a_np, _h_np = A_t, B_t, a_np, h_np
 
-        y = cat(ys, axis=1)                        # (B, T, 1)
-        h_last = h_t                               # (B, state_dim)
+        def _scan_back():
+            if h_all.grad is None:
+                return
+            grad_a, grad_b = parallel_scan_ssm_backward(_a_np, _h_np,
+                                                         h_all.grad.astype(np.float32))
+            if _A_t.requires_grad:
+                _A_t.grad = _A_t.grad + grad_a if _A_t.grad is not None else grad_a
+            if _B_t.requires_grad:
+                _B_t.grad = _B_t.grad + grad_b if _B_t.grad is not None else grad_b
 
-        # Hebbian update during training (numpy in-place, not autograd)
+        h_all._backward = _scan_back
+
+        # Vectorised output — no per-timestep Python loop
+        y = (C_t * h_all).sum(axis=-1, keepdims=True)          # (B, T, 1)
+        skip = (self.D * x).sum(axis=-1, keepdims=True)         # (B, T, 1)
+        y = y + skip
+
+        # h_last: last timestep, gradient-connected
+        h_last_np = h_np[:, -1, :].astype(np.float64)
+        h_last = Tensor(h_last_np, requires_grad=h_all.requires_grad,
+                        _children=(h_all,), _op="h_last_slice")
+        _h_all = h_all
+
+        def _h_last_back():
+            if _h_all.requires_grad and h_last.grad is not None:
+                contrib = np.zeros_like(_h_all.data)
+                contrib[:, -1, :] = h_last.grad
+                _h_all.grad = (_h_all.grad + contrib
+                               if _h_all.grad is not None else contrib)
+
+        h_last._backward = _h_last_back
+
+        # Hebbian update during training (numpy, not autograd)
         if self.training:
-            h_np = np.stack([hh.data for hh in h_all], axis=1)  # (B, T, state_dim)
             self.hebbian_update(h_np)
 
         return y, h_last

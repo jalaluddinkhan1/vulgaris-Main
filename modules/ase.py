@@ -251,76 +251,40 @@ class AdaptiveSignalEmbedding(Module):
                 # For each scale s: out_s = dilated_conv(x_mixed, kernels_1ch, dilation=2^s)
                 # dout_s/d_x_mixed[filter_k, t] involves the convolution kernel
                 # We approximate: dL/d_x_mixed via transposed convolution
+                from engine.fft_conv import fft_conv1d_backward
                 g_cm = np.zeros_like(self.channel_mix.data)
-                g_xmixed = np.zeros((_B, self.n_filters, _T), dtype=np.float64)
+                g_xmixed = np.zeros((_B, self.n_filters, _T), dtype=np.float32)
 
                 for s in range(self.n_scales):
-                    dilation = 2 ** s
-                    fl_loc = _kernels.shape[2]
-                    padding = dilation * (fl_loc // 2)
-                    k_eff = (fl_loc - 1) * dilation + 1
-
-                    # Dilate kernel
-                    if dilation == 1:
-                        dk = _kernels  # (n_filters, 1, fl)
-                    else:
-                        K_eff = (fl_loc - 1) * dilation + 1
-                        dk = np.zeros((self.n_filters, 1, K_eff), dtype=np.float64)
-                        dk[:, :, ::dilation] = _kernels
-
                     g_s = g_bct[:, s * self.n_filters:(s + 1) * self.n_filters, :]
-                    # (B, n_filters, T) — grad w.r.t. out_s
+                    # FFT-based transposed conv: O(T log T) vs O(T*K) loop
+                    g_xm_s, _ = fft_conv1d_backward(
+                        g_s.astype(np.float32),
+                        _x_mixed.astype(np.float32),
+                        _kernels_2d.astype(np.float32),
+                        dilation=2 ** s,
+                    )
+                    g_xmixed += g_xm_s
 
-                    # Transposed conv: grad w.r.t. x_mixed for scale s
-                    # out = sum_k kernel[f,0,k] * x_mixed[f, t-k+pad]
-                    # grad_xmixed[f,t] = sum_k kernel[f,0,k] * g_s[f, t+k-pad]
-                    # (full-padding transposed convolution)
-                    K_eff2 = dk.shape[2]
-                    # Pad g_s for transposed conv
-                    g_s_pad = np.pad(g_s, ((0, 0), (0, 0), (K_eff2 - 1, K_eff2 - 1)),
-                                     mode="constant")
-                    # Flip kernel for transposed conv
-                    dk_flip = dk[:, :, ::-1]  # (n_filters, 1, K_eff)
-
-                    for k_idx in range(K_eff2):
-                        t_end = k_idx + _T
-                        if t_end > g_s_pad.shape[2]:
-                            break
-                        g_xmixed += dk_flip[:, :, k_idx] * g_s_pad[:, :, k_idx:k_idx + _T]
-
-                # grad_xmixed: (B, n_filters, T)
-                # x_mixed = cm @ x_np: x_np shape (B, actual_in, T)
-                # grad_cm[f, i] = sum_b sum_t g_xmixed[b,f,t] * x_np[b,i,t]
                 g_cm[:, :_actual_in] = np.einsum("bft,bit->fi", g_xmixed, _x_np)
-                contrib = g_cm
-                self.channel_mix.grad = (self.channel_mix.grad + contrib
-                                         if self.channel_mix.grad is not None else contrib)
+                self.channel_mix.grad = (self.channel_mix.grad + g_cm
+                                         if self.channel_mix.grad is not None else g_cm)
 
             if x.requires_grad:
-                # grad w.r.t. x_np[:, :C, :] via cm
-                g_xmixed2 = np.zeros((_B, self.n_filters, _T), dtype=np.float64)
-                for s in range(self.n_scales):
-                    dilation = 2 ** s
-                    fl_loc = _kernels.shape[2]
-                    if dilation == 1:
-                        dk = _kernels
-                    else:
-                        K_eff = (fl_loc - 1) * dilation + 1
-                        dk = np.zeros((self.n_filters, 1, K_eff), dtype=np.float64)
-                        dk[:, :, ::dilation] = _kernels
-                    g_s = g_bct[:, s * self.n_filters:(s + 1) * self.n_filters, :]
-                    K_eff2 = dk.shape[2]
-                    g_s_pad = np.pad(g_s, ((0, 0), (0, 0), (K_eff2 - 1, K_eff2 - 1)),
-                                     mode="constant")
-                    dk_flip = dk[:, :, ::-1]
-                    for k_idx in range(K_eff2):
-                        t_end = k_idx + _T
-                        if t_end > g_s_pad.shape[2]:
-                            break
-                        g_xmixed2 += dk_flip[:, :, k_idx] * g_s_pad[:, :, k_idx:k_idx + _T]
+                from engine.fft_conv import fft_conv1d_backward
+                g_xmixed2 = np.zeros((_B, self.n_filters, _T), dtype=np.float32)
 
-                # grad_x[b,i,t] = sum_f cm[f,i] * g_xmixed2[b,f,t]
-                g_x = np.einsum("fi,bft->bit", _cm_data, g_xmixed2)  # (B, C, T)
+                for s in range(self.n_scales):
+                    g_s = g_bct[:, s * self.n_filters:(s + 1) * self.n_filters, :]
+                    g_xm_s, _ = fft_conv1d_backward(
+                        g_s.astype(np.float32),
+                        _x_mixed.astype(np.float32),
+                        _kernels_2d.astype(np.float32),
+                        dilation=2 ** s,
+                    )
+                    g_xmixed2 += g_xm_s
+
+                g_x = np.einsum("fi,bft->bit", _cm_data, g_xmixed2)
                 contrib_x = g_x[:, :C, :]
                 x.grad = x.grad + contrib_x if x.grad is not None else contrib_x
 

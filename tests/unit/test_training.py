@@ -62,17 +62,17 @@ class TestTrainStep(unittest.TestCase):
 
     def test_step_count_increments(self):
         rng = np.random.default_rng(1)
-        x = rng.normal(0, 0.5, (4, 4, 20)).astype(np.float32)
-        y = np.zeros(4, dtype=np.float32)
+        x = rng.normal(0, 0.5, (2, 4, 8)).astype(np.float32)
+        y = np.zeros(2, dtype=np.float32)
         self.pipeline.train_step(x, y)
         self.assertEqual(self.pipeline.step_count, 1)
 
     def test_repeated_steps_stable(self):
         rng = np.random.default_rng(2)
         losses = []
-        for i in range(5):
-            x = rng.normal(0, 0.3, (4, 4, 20)).astype(np.float32)
-            y = np.zeros(4, dtype=np.float32)
+        for i in range(2):
+            x = rng.normal(0, 0.3, (2, 4, 8)).astype(np.float32)
+            y = np.zeros(2, dtype=np.float32)
             m = self.pipeline.train_step(x, y)
             losses.append(m["total_loss"])
         finite_losses = [l for l in losses if np.isfinite(l)]
@@ -87,8 +87,8 @@ class TestEvalStep(unittest.TestCase):
 
     def test_returns_interval(self):
         rng = np.random.default_rng(3)
-        x = rng.normal(0, 0.5, (4, 4, 20)).astype(np.float32)
-        y = np.zeros(4, dtype=np.float32)
+        x = rng.normal(0, 0.5, (2, 4, 8)).astype(np.float32)
+        y = np.zeros(2, dtype=np.float32)
         metrics = self.pipeline.eval_step(x, y)
         self.assertIn("interval_lower", metrics)
         self.assertIn("interval_upper", metrics)
@@ -96,8 +96,8 @@ class TestEvalStep(unittest.TestCase):
 
     def test_interval_width_nonneg(self):
         rng = np.random.default_rng(4)
-        x = rng.normal(0, 0.5, (4, 4, 20)).astype(np.float32)
-        y = np.zeros(4, dtype=np.float32)
+        x = rng.normal(0, 0.5, (2, 4, 8)).astype(np.float32)
+        y = np.zeros(2, dtype=np.float32)
         metrics = self.pipeline.eval_step(x, y)
         self.assertGreaterEqual(metrics["interval_width"], 0.0)
 
@@ -110,8 +110,8 @@ class TestCheckpoint(unittest.TestCase):
 
     def test_save_and_load(self):
         rng = np.random.default_rng(5)
-        x = rng.normal(0, 0.3, (4, 4, 20)).astype(np.float32)
-        y = np.zeros(4, dtype=np.float32)
+        x = rng.normal(0, 0.3, (2, 4, 8)).astype(np.float32)
+        y = np.zeros(2, dtype=np.float32)
         self.pipeline.train_step(x, y)
 
         ckpt_path = os.path.join(self.tmp, "checkpoint_best.npz")

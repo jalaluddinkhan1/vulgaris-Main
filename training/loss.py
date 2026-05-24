@@ -16,6 +16,8 @@ class VulgarisLoss(Module):
 
     def __init__(self, config, task: str = None):
         super().__init__()
+        if task is None:
+            task = 'classification' if getattr(config, 'n_classes', 0) > 0 else 'regression'
         self.task = task
 
         tc = config.training

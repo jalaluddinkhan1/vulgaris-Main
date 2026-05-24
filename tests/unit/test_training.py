@@ -14,15 +14,20 @@ from engine.tensor import Tensor
 
 def _small_config():
     cfg = ModelConfig(input_dim=4, output_dim=1, n_classes=3)
-    cfg.ase.latent_dim = 32
-    cfg.ase.n_filters = 8
+    cfg.ase.latent_dim = 16
+    cfg.ase.n_filters = 4
     cfg.ase.n_scales = 2
-    cfg.sssr.state_dim = 16
-    cfg.sssr.d_inner = 64
+    cfg.ase.filter_len = 4
+    cfg.sssr.state_dim = 8
+    cfg.sssr.d_inner = 16
+    cfg.sssr.n_heads = 2
     cfg.crg.n_nodes = 4
-    cfg.hmb.n_slots = 8
-    cfg.hmb.embed_dim = 32
-    cfg.hmb.compress_dim = 8
+    cfg.crg.n_lags = 2
+    cfg.hmb.embed_dim = 16
+    cfg.hmb.compress_dim = 4
+    cfg.hmb.buffer_size = 4
+    cfg.htd.n_levels = 2
+    cfg.htd.time_constants = [0.1, 1.0]
     return cfg
 
 
@@ -49,8 +54,8 @@ class TestTrainStep(unittest.TestCase):
 
     def test_returns_finite_loss(self):
         rng = np.random.default_rng(0)
-        x = rng.normal(0, 0.5, (4, 4, 20)).astype(np.float32)
-        y = np.zeros((4,), dtype=np.float32)
+        x = rng.normal(0, 0.5, (2, 4, 8)).astype(np.float32)
+        y = np.zeros((2,), dtype=np.float32)
         metrics = self.pipeline.train_step(x, y, domain_idx=0)
         self.assertIn("total_loss", metrics)
         self.assertTrue(np.isfinite(metrics["total_loss"]) or metrics["total_loss"] == float('inf'))

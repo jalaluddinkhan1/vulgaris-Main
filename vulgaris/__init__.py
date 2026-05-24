@@ -23,6 +23,7 @@ from training.conformal import NonStationaryConformal
 from modules.multitask_head import MultiTaskHead
 from monitoring.drift       import DriftDetector
 from vulgaris.utils         import set_seed, get_rng
+from vulgaris.pretrained    import from_pretrained, save_pretrained
 
 __all__ = [
     "__version__",
@@ -35,4 +36,5 @@ __all__ = [
     "TrainingPipeline", "VulgarisLoss", "SpectralAdamW", "CosineSchedule",
     "NonStationaryConformal", "MultiTaskHead", "DriftDetector",
     "set_seed", "get_rng",
+    "from_pretrained", "save_pretrained",
 ]

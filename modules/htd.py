@@ -61,28 +61,93 @@ class HTDLevel(Module):
 
         B_in = self.B_proj(x)   # (batch, T, state_dim)
 
-        # Recurrent scan over T — sequential for correctness
-        h_t = h_prev  # (batch, state_dim)
-        ys = []
+        # b_prime = (1 - A_bar) * B_in  — effective input after gating
+        # Keep as Tensor so its backward flows to A_bar and B_in
+        one_minus_a = Tensor(
+            (1.0 - A_bar.data).astype(np.float32),
+            requires_grad=A_bar.requires_grad,
+            _children=(A_bar,), _op="one_minus_a"
+        )
+        _A_bar_ref = A_bar
 
-        for t in range(T):
-            a_t = A_bar[:, t, :]    # (batch, state_dim)
-            b_t = B_in[:, t, :]     # (batch, state_dim)
+        def _oma_back():
+            if _A_bar_ref.requires_grad and one_minus_a.grad is not None:
+                contrib = -one_minus_a.grad.astype(_A_bar_ref.data.dtype)
+                _A_bar_ref.grad = (_A_bar_ref.grad + contrib
+                                   if _A_bar_ref.grad is not None else contrib)
 
-            # h_t = a_t * h_{t-1} + (1 - a_t) * b_t
-            h_t = a_t * h_t + (Tensor(np.ones(a_t.shape)) - a_t) * b_t
+        one_minus_a._backward = _oma_back
+        b_prime = one_minus_a * B_in    # (batch, T, state_dim) — Tensor
 
-            if bias is not None:
-                h_t = h_t + bias
+        # Add cross-level bias broadcast over T
+        if bias is not None:
+            bias_np = np.broadcast_to(
+                bias.data[:, None, :], b_prime.data.shape).copy().astype(np.float32)
+            bias_t = Tensor(bias_np, requires_grad=bias.requires_grad,
+                            _children=(bias,), _op="bias_broadcast")
+            _bias = bias; _bias_t = bias_t; _T = T
 
-            y_t = self.C_proj(h_t)   # (batch, d_model)
-            ys.append(y_t.unsqueeze(1))  # (batch, 1, d_model)
+            def _bias_back():
+                if _bias.requires_grad and _bias_t.grad is not None:
+                    _bias.grad = ((_bias.grad + _bias_t.grad.sum(axis=1))
+                                  if _bias.grad is not None
+                                  else _bias_t.grad.sum(axis=1))
 
-        # Stack along time
-        # Use cat instead of stack to preserve gradient
+            bias_t._backward = _bias_back
+            b_prime = b_prime + bias_t
+
+        # Parallel scan: h[t] = A_bar[t]*h[t-1] + b_prime[t]
+        from engine.parallel_scan import parallel_scan_ssm, parallel_scan_ssm_backward
+
+        a_np = A_bar.data.astype(np.float32)
+        bp_np = b_prime.data.astype(np.float32)
+        h_init_np = h_prev.data.astype(np.float32)
+
+        h_np = parallel_scan_ssm(a_np, bp_np, h_init_np)  # (batch, T, state_dim)
+
+        h_scan = Tensor(
+            h_np,
+            requires_grad=A_bar.requires_grad or b_prime.requires_grad,
+            _children=(A_bar, b_prime),
+            _op="htd_parallel_scan"
+        )
+        _A_bar, _b_prime, _a_np, _h_np = A_bar, b_prime, a_np, h_np
+
+        def _htd_scan_back():
+            if h_scan.grad is None:
+                return
+            grad_a, grad_bp = parallel_scan_ssm_backward(
+                _a_np, _h_np, h_scan.grad.astype(np.float32))
+            if _A_bar.requires_grad:
+                _A_bar.grad = (_A_bar.grad + grad_a
+                               if _A_bar.grad is not None else grad_a)
+            if _b_prime.requires_grad:
+                _b_prime.grad = (_b_prime.grad + grad_bp
+                                 if _b_prime.grad is not None else grad_bp)
+
+        h_scan._backward = _htd_scan_back
+
+        # Vectorised C projection over all timesteps at once
         from engine.tensor import cat as tcat
-        y = tcat(ys, axis=1)  # (batch, T, d_model)
-        h_last = h_t          # (batch, state_dim)
+        B_sz2, T2, N = h_np.shape
+        h_flat = h_scan.reshape(B_sz2 * T2, N)
+        y_flat = self.C_proj(h_flat)           # (batch*T, d_model)
+        y = y_flat.reshape(B_sz2, T2, -1)      # (batch, T, d_model)
+
+        # h_last: final hidden state with gradient connection
+        h_last_np = h_np[:, -1, :].astype(np.float64)
+        h_last = Tensor(h_last_np, requires_grad=h_scan.requires_grad,
+                        _children=(h_scan,), _op="htd_h_last")
+        _h_scan = h_scan
+
+        def _htd_h_last_back():
+            if _h_scan.requires_grad and h_last.grad is not None:
+                contrib = np.zeros_like(_h_scan.data)
+                contrib[:, -1, :] = h_last.grad
+                _h_scan.grad = (_h_scan.grad + contrib
+                                if _h_scan.grad is not None else contrib)
+
+        h_last._backward = _htd_h_last_back
 
         if squeeze_T:
             y = y.squeeze(1)

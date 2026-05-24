@@ -11,7 +11,7 @@ from engine.tensor import Tensor
 from config import ModelConfig
 
 
-def _default_config(d_model=32, n_classes=3, input_dim=4):
+def _default_config(d_model=16, n_classes=3, input_dim=4):
     """Minimal config for fast testing."""
     cfg = ModelConfig(
         input_dim=input_dim,
@@ -19,14 +19,19 @@ def _default_config(d_model=32, n_classes=3, input_dim=4):
         n_classes=n_classes,
     )
     cfg.ase.latent_dim = d_model
-    cfg.ase.n_filters = 8
+    cfg.ase.n_filters = 4
     cfg.ase.n_scales = 2
-    cfg.sssr.state_dim = 16
+    cfg.ase.filter_len = 4
+    cfg.sssr.state_dim = 8
     cfg.sssr.d_inner = d_model * 2
+    cfg.sssr.n_heads = 2
     cfg.crg.n_nodes = 4
-    cfg.hmb.n_slots = 8
+    cfg.crg.n_lags = 2
     cfg.hmb.embed_dim = d_model
-    cfg.hmb.compress_dim = max(d_model // 4, 8)
+    cfg.hmb.compress_dim = max(d_model // 4, 4)
+    cfg.hmb.buffer_size = 4
+    cfg.htd.n_levels = 2
+    cfg.htd.time_constants = [0.1, 1.0]
     return cfg
 
 
@@ -102,29 +107,29 @@ class TestVulgaris(unittest.TestCase):
 
     def setUp(self):
         from model.vulgaris import Vulgaris
-        self.cfg = _default_config(d_model=32, n_classes=3, input_dim=4)
+        self.cfg = _default_config(d_model=16, n_classes=3, input_dim=4)
         self.model = Vulgaris(self.cfg)
 
     def test_forward_shape(self):
-        B, C, T = 2, 4, 20
+        B, C, T = 2, 4, 8
         x = Tensor(np.random.randn(B, C, T).astype(np.float32))
         out, aux = self.model(x)
         self.assertEqual(out.data.shape, (B, 3))  # n_classes=3
 
     def test_output_float32(self):
-        x = Tensor(np.random.randn(2, 4, 20).astype(np.float32))
+        x = Tensor(np.random.randn(2, 4, 8).astype(np.float32))
         out, _ = self.model(x)
         self.assertEqual(out.data.dtype, np.float32)
 
     def test_output_finite(self):
-        x = Tensor(np.random.randn(2, 4, 20).astype(np.float32))
+        x = Tensor(np.random.randn(2, 4, 8).astype(np.float32))
         out, aux = self.model(x)
         self.assertTrue(np.all(np.isfinite(out.data)))
         h = aux["h_states"]
         self.assertTrue(np.all(np.isfinite(h.data)))
 
     def test_softmax_sums_to_one(self):
-        x = Tensor(np.random.randn(2, 4, 20).astype(np.float32))
+        x = Tensor(np.random.randn(2, 4, 8).astype(np.float32))
         out, _ = self.model(x)
         row_sums = out.data.sum(axis=-1)
         np.testing.assert_allclose(row_sums, np.ones_like(row_sums), atol=1e-5)
@@ -139,7 +144,7 @@ class TestVulgaris(unittest.TestCase):
 
     def test_multi_domain(self):
         """DAH domain switching shouldn't crash."""
-        x = Tensor(np.random.randn(2, 4, 20).astype(np.float32))
+        x = Tensor(np.random.randn(2, 4, 8).astype(np.float32))
         for domain in range(3):
             out, _ = self.model(x, domain_idx=domain)
             self.assertTrue(np.all(np.isfinite(out.data)))

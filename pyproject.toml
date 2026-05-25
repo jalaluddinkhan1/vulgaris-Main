@@ -10,7 +10,7 @@ name        = "vulgaris"
 version     = "0.3.0"
 description = "Foundational industrial AI model for real-time telemetry, IoT, and time-series"
 readme      = "README.md"
-license     = { text = "Apache-2.0" }
+license     = "Apache-2.0"
 requires-python = ">=3.10"
 
 keywords = [
@@ -23,7 +23,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

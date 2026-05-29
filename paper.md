@@ -1850,6 +1850,182 @@ The industrial systems for which VULGARIS is designed are not static artifacts. 
 
 ---
 
+## Section 23: Additional Architectural Components
+
+### 17.1 In-Context Learning (ICL)
+
+VULGARIS supports zero-shot task adaptation at inference time via an **In-Context Learning** module (`modules/icl.py`) that requires no gradient updates. Given a small set of labelled reference examples $\{(x_{\text{ref}}^{(i)}, y_{\text{ref}}^{(i)})\}_{i=1}^{K}$ provided at inference time, the model conditions its latent representations on these examples through cross-attention.
+
+**Architecture.** Each reference pair is encoded by a `ContextEncoder`: $x_{\text{ref}}^{(i)}$ passes through RevIN and ASE to produce a latent sequence $z_{\text{ref}}^{(i)} \in \mathbb{R}^{B \times T_{\text{ref}} \times d_{\text{model}}}$, which is mean-pooled to a single vector $\bar{z}_{\text{ref}}^{(i)} \in \mathbb{R}^{B \times d_{\text{model}}}$. The label $y_{\text{ref}}^{(i)}$ is projected to $d_{\text{model}}$ and summed with $\bar{z}_{\text{ref}}^{(i)}$, yielding one context vector per example. An `InContextAdapter` then applies cross-attention between the model's post-SSSR latent $z$ (as queries) and the stacked context vectors (as keys/values), producing a context-conditioned residual that is added to $z$ before CRG and HMB.
+
+**Properties.** ICL enables zero-shot domain transfer without retraining. It is complementary to DAH (Section 8): DAH adapts via hypernetwork-generated LoRA weights (requires some in-distribution training), while ICL adapts at inference time from arbitrary labelled examples with no parameter updates. The computational cost is $O(K \cdot T \cdot d_{\text{model}})$ per forward pass, with $K$ typically in the range 4–32.
+
+---
+
+### 17.2 Self-Supervised Pre-Training (`training/self_supervised.py`)
+
+VULGARIS is pre-trained using four complementary self-supervised objectives implemented in `SelfSupervisedTrainer`:
+
+**1. Masked Reconstruction.** A random fraction $r \sim \mathcal{U}(0.15, 0.30)$ of timesteps are zeroed in the input. A `MaskedReconstructionHead` (linear projection from $d_{\text{model}}$ to $C$) reconstructs the original signal at masked positions via MSE. This forces the encoder to learn to fill temporal gaps from context — equivalent to BERT-style masked language modelling for continuous signals.
+
+**2. Temporal Contrastive (InfoNCE).** For each batch item, an anchor timestep $t_a$ and a positive timestep $t_p = t_a + \delta$ (with $\delta \sim \mathcal{U}(1, W)$, $W=5$) are sampled. The InfoNCE loss:
+$$\mathcal{L}_{\text{NCE}} = -\frac{1}{B}\sum_{b=1}^{B} \log \frac{\exp(\text{sim}(z_{t_a}^b, z_{t_p}^b)/\tau)}{\sum_{t} \exp(\text{sim}(z_{t_a}^b, z_t^b)/\tau)}$$
+encourages temporally proximate embeddings to be similar and distal embeddings to be distinguishable. Temperature $\tau = 0.07$.
+
+**3. Forecasting Pre-Training.** A `ForecastHead` (linear from $d_{\text{model}}$ to $H \times C$) projects the last hidden state to $H$ future timesteps. MSE against the held-out ground truth future trains the model to represent predictive information in its final state.
+
+**4. Channel Correlation Pre-Training.** The empirical correlation matrix $R \in \mathbb{R}^{C \times C}$ is computed from each window. The mean-pooled latent $\bar{z}$ is projected to $C^2$ dimensions and trained to predict $R$ via MSE. This forces the encoder to capture inter-sensor causal structure.
+
+All four objectives are optimized jointly using `SpectralAdamW`. During deployment, the pre-trained encoder transfers to downstream tasks (anomaly detection, forecasting, classification) via fine-tuning of lightweight task heads.
+
+---
+
+### 17.3 Non-Stationary Conformal Prediction (`training/conformal.py`)
+
+The `NonStationaryConformal` class implements an EnbPI-style (Xu and Xie, 2021) adaptive conformal predictor with exponential forgetting. Unlike standard split conformal prediction, which assumes exchangeability, this implementation handles non-stationary industrial streams where the data distribution shifts over time.
+
+**Calibration.** For each new observation $(x_t, y_t)$, the nonconformity score $s_t = |y_t - \hat{y}_t| / (\hat{\sigma}_t + \epsilon)$ is appended to a sliding window with exponentially decayed weights $w_t = e^{-\lambda(T-t)}$, where $\lambda$ is the forgetting factor. Older scores are downweighted, allowing the quantile to track a shifting distribution.
+
+**Prediction interval.** The weighted quantile at level $1-\alpha$ is computed as $\hat{q} = \inf\{q : \sum_t w_t \mathbf{1}[s_t \leq q] / \sum_t w_t \geq 1-\alpha\}$. The prediction interval is $[\hat{y} - \hat{q}\hat{\sigma},\, \hat{y} + \hat{q}\hat{\sigma}]$.
+
+**Coverage guarantee.** Under the assumption that the distribution shifts slowly relative to the forgetting rate $\lambda$, empirical coverage tracks the nominal level $1-\alpha$ asymptotically. The `is_calibrated()` method reports whether coverage is within 2 percentage points of the target, requiring at least 50 calibration samples.
+
+---
+
+### 17.4 Compute Backend Hierarchy
+
+VULGARIS implements a three-tier compute backend (`engine/backend.py`, auto-detected via `VULGARIS_BACKEND`):
+
+**Triton (GPU).** The SSM linear recurrence and FFT-dilated convolution dispatch to custom Triton CUDA kernels when `torch` and `triton` are available and a CUDA device is present. The SSM forward kernel (`engine/backends/triton_ops/ssm_scan.py`) parallelises over (batch, $D$-block) with each thread block running a sequential scan in SRAM, achieving near-optimal memory bandwidth. The fused linear kernel (`engine/backends/triton_ops/linear.py`) implements a tiled GEMM $Y = XW^\top + b$ with configurable block sizes.
+
+**Numba (CPU JIT).** On CPU-only systems, the parallel scan and element-wise operations compile via Numba's `@njit` with `parallel=True`, exploiting SIMD vectorisation and multi-core parallelism without requiring PyTorch.
+
+**NumPy (fallback).** Pure NumPy provides correctness-guaranteed execution on any platform, used as the reference implementation for validation and edge deployment where Numba is unavailable.
+
+The backend is resolved once at import time and cached. All three tiers implement identical numerical interfaces, making the backend selection fully transparent to all higher-level modules.
+
+---
+
+### 17.5 Normalisation and Activation Components
+
+**RevIN (Reversible Instance Normalisation).** VULGARIS applies reversible instance normalisation (Kim et al., 2022) at the input boundary. Per-instance mean $\mu$ and standard deviation $\sigma$ are computed over the time axis and used to normalise the input; affine parameters $(\gamma, \beta)$ are learned. At the output boundary, the inverse transform $\hat{y}_{\text{orig}} = \hat{y} \cdot \sigma + \mu$ is applied, ensuring that the model's predictions are in the original signal scale. This is critical for multi-sensor inputs where channels have heterogeneous physical units and magnitudes.
+
+**SwiGLU.** Feed-forward blocks within VULGARIS use the SwiGLU activation (Shazeer, 2020): $\text{SwiGLU}(x) = (W_1 x) \otimes \sigma(W_2 x)$, where $\sigma$ is the sigmoid function and $\otimes$ is element-wise multiplication. SwiGLU provides smooth gating without the dead-neuron problem of ReLU and has been shown empirically to outperform GeLU and ReLU in both language and time-series architectures.
+
+**CausalAttention.** The ICL adapter uses a multi-head causal attention layer with $O(T^2)$ complexity, acceptable for the short context sequences ($T \leq 128$) used in the adapter path. Causal masking ensures that the attention attends only to preceding context vectors, preserving the temporal ordering invariant throughout the architecture.
+
+---
+
+### 17.6 Model Distribution API (`vulgaris/pretrained.py`)
+
+VULGARIS provides a `from_pretrained` / `save_pretrained` API for weight distribution:
+
+```python
+# Save trained weights + config
+save_pretrained(model, cfg, output_dir, name="vulgaris-base-v1")
+# → writes vulgaris-base-v1.npz  (parameter arrays)
+# → writes vulgaris-base-v1-config.json
+
+# Load from local path or Hugging Face Hub
+model = from_pretrained("keysparktech/vulgaris", config=cfg)
+model = from_pretrained("/local/path/vulgaris-base-v1.npz", config=cfg)
+```
+
+Weights are stored as `.npz` archives with keys `model__{param_name}`, enabling framework-agnostic inspection. The loader resolves paths in order: (1) local filesystem, (2) Hugging Face Hub via `huggingface_hub` (with automatic caching), (3) direct HTTPS download as fallback. This API enables one-line deployment of pre-trained VULGARIS checkpoints without requiring the full training infrastructure.
+
+---
+
+## Section 24: Production Engineering Components
+
+### 24.1 Distribution Shift Monitor (`monitoring/drift.py`)
+
+Industrial deployments are perpetually exposed to gradual sensor drift, process chemistry changes, and equipment aging — all of which manifest as shifts in the input distribution $P_t(\mathbf{x})$ relative to the training distribution $P_0(\mathbf{x})$. VULGARIS provides a `DriftDetector` class that maintains a reference window of recent latent features and computes three complementary shift statistics against a live window.
+
+**Kolmogorov–Smirnov statistic.** For each feature dimension $d$, the two-sample KS statistic:
+$$D_d = \sup_x |F_{\text{ref},d}(x) - F_{\text{live},d}(x)|$$
+is computed. The reported statistic is $D = \max_d D_d$, the worst-case feature shift. KS is sensitive to location and scale shifts but insensitive to changes in higher moments.
+
+**Linear MMD.** The Maximum Mean Discrepancy with an RBF kernel approximation:
+$$\widehat{\text{MMD}}^2 = \frac{1}{n^2}\sum_{i,j}k(x_i,x_j) + \frac{1}{m^2}\sum_{i,j}k(y_i,y_j) - \frac{2}{nm}\sum_{i,j}k(x_i,y_j)$$
+where $k(x,y)=\exp(-\|x-y\|^2/(2\sigma^2))$ with $\sigma$ set to the median pairwise distance. MMD detects distributional differences beyond first and second moments.
+
+**Wasserstein-1D.** The Earth Mover's Distance along the first principal component of the reference window, computed as $W_1 = \int |F_{\text{ref}}(x) - F_{\text{live}}(x)|\,dx$ via the sorted difference of empirical CDFs. This is sensitive to transport cost — how far mass must be moved to align the two distributions — and provides an interpretable magnitude in feature units.
+
+The three statistics are computed on each call to `detect(live_features)` and compared against per-statistic thresholds. A detection event triggers the SHCAL adaptation loop (Section 10) to increase the EWC forgetting rate and accelerate plasticity, and optionally emits an alert via the production server (Section 24.3).
+
+---
+
+### 24.2 Federated Continual Learning (`federated/protocol.py`)
+
+Industrial deployments frequently operate under data locality constraints: sensor data cannot leave the physical site due to regulatory requirements (GDPR, NERC CIP for power grids) or network bandwidth limitations. VULGARIS implements a federated training protocol that allows multiple edge nodes to jointly improve a shared model without centralizing raw data.
+
+**Differential privacy via Rényi accounting.** Each participating node clips its local gradient to $\ell_2$ norm $C$ and adds Gaussian noise with standard deviation $\sigma_{\text{dp}} = C \cdot z / \sqrt{n_{\text{local}}}$, where $z$ is the noise multiplier and $n_{\text{local}}$ is the local batch size. The `DPNoiseAdder` class tracks privacy budget using Rényi Differential Privacy (RDP) accounting (Mironov, 2017): each noisy gradient step consumes $\epsilon_{\text{step}}(\alpha) = \alpha / (2\sigma_{\text{dp}}^2)$ Rényi divergence of order $\alpha$. Budget accumulation and the RDP-to-$(\epsilon, \delta)$-DP conversion are maintained in-process, enabling the orchestrator to halt participation when a per-node budget $\epsilon_{\text{budget}}$ is reached.
+
+**Top-$k$ gradient sparsification with error feedback.** Raw gradients are $O(P)$ in parameter count and expensive to transmit. The `GradientCompressor` retains only the top-$k$ coordinates by absolute magnitude ($k = 0.01 \times P$ by default, 1% sparsity) and encodes them as (index, value) pairs. Coordinates not transmitted are accumulated in a per-node error buffer $e_t$; at the next round, $e_t$ is added to the new gradient before sparsification, ensuring that suppressed small gradients eventually propagate and the compressed scheme converges to the same optimum as dense SGD (Stich et al., 2018).
+
+**Orchestrator.** `FederatedContinualLearning` aggregates compressed, noisy gradients from $N$ nodes via simple averaging (FedAvg, McMahan et al., 2017), applies the update to the global model, and distributes the new parameters. Each node applies EWC regularization (Section 10.2) to prevent the global update from overwriting locally specialized representations — combining federated averaging with continual learning without requiring a shared replay buffer.
+
+---
+
+### 24.3 Production Serving Stack (`inference/server.py`, `serve/`)
+
+VULGARIS ships a FastAPI-based production inference server providing REST endpoints for all core model capabilities.
+
+**Endpoints.** `/predict` (batch point prediction), `/stream` (single-step streaming with state threading), `/step` (explicit SSM state step), `/explain` (CRG-based causal attribution for a given prediction), `/counterfactual` (ESE-generated counterfactual explanation), `/domain/register` (register a new domain embedding for DAH zero-shot adaptation).
+
+**Authentication.** The `AuthMiddleware` validates a bearer token or `X-API-Key` header against a list of keys loaded from the `VULGARIS_API_KEYS` environment variable. Unauthenticated requests receive HTTP 401 before reaching model code.
+
+**Graceful degradation.** The `DegradationController` (`serve/degradation.py`) monitors the rolling p95 inference latency and per-minute error rate. When p95 latency exceeds $t_{\text{warn}}$ (default: 45 ms) or error rate exceeds $r_{\text{warn}}$ (default: 5%), the server transitions from `full` to `reduced` mode (disabling HMB retrieval and ESE explanation). When latency exceeds $t_{\text{crit}}$ (default: 100 ms) or error rate exceeds $r_{\text{crit}}$ (default: 20%), it transitions to `alert_only` mode (returning cached predictions with staleness flags). Recovery is automatic after a configurable window with statistics below the warn thresholds.
+
+**Model versioning and A/B testing.** The `VersionRegistry` (`serve/versioning.py`) maintains a map of named model versions with their weights, configs, and traffic fractions. Incoming requests are routed deterministically by request hash, allowing canary deployments where, e.g., 10% of traffic routes to a new checkpoint while 90% uses the stable version. Version metrics are tracked independently, enabling data-driven rollback decisions.
+
+**In-process metrics.** `serve/metrics.py` provides counter, gauge, and histogram primitives with an exposition endpoint at `/metrics` in Prometheus text format, without requiring a Prometheus client library as a dependency. This satisfies the traceability requirements of IEC 61508 auditors without introducing external package dependencies.
+
+---
+
+### 24.4 MultiTaskHead (`modules/multitask_head.py`)
+
+All downstream tasks — forecasting, anomaly detection, classification, and uncertainty quantification — are served by a single unified `MultiTaskHead` that branches from the shared latent representation $\mathbf{z} \in \mathbb{R}^{B \times T \times D}$ in a single forward pass.
+
+**Outputs.** From the final hidden state $\mathbf{z}_T$ (last timestep):
+- **Forecast:** linear projection to $(B, H, C)$ — $H$ future timesteps over $C$ channels
+- **Anomaly score:** linear projection to $(B, 1)$, scalar surprise score in $[0, \infty)$
+- **Class probabilities:** linear projection to $(B, n_{\text{classes}})$ followed by softmax
+- **Uncertainty:** linear projection to $(B, 1)$ followed by softplus, giving a positive predictive variance estimate
+
+The four heads share no parameters and are trained jointly under the unified loss (Section 16.1). The multi-task formulation provides two benefits over four independent heads: (1) the shared encoder is regularized by four gradient signals simultaneously, improving generalization on each individual task; (2) a single forward pass produces all four outputs, eliminating redundant encoder computation at inference time. In production, the `MultiTaskHead` outputs are consumed directly by the serving layer (Section 24.3), the conformal predictor (Section 17.3), and the anomaly alert pipeline.
+
+---
+
+### 24.5 Training Data Augmentation and Curriculum (`training/pipeline.py`)
+
+**TimeSeriesAugment.** Four stochastic augmentations are applied independently to each training window with configurable probabilities:
+
+1. *Additive noise:* $\mathbf{x} \leftarrow \mathbf{x} + \mathcal{N}(0, \sigma_{\text{noise}}^2)$ where $\sigma_{\text{noise}} = 0.02 \times \text{std}(\mathbf{x})$. Improves robustness to sensor quantization noise and ADC jitter.
+2. *Channel dropout:* a random fraction $p_{\text{drop}} \in [0.05, 0.15]$ of input channels are zeroed, simulating sensor outages. This is the same mechanism used in Phase 2 pretraining (Section 16.3) and encourages the encoder to exploit inter-channel redundancy.
+3. *Magnitude scaling:* $\mathbf{x} \leftarrow s \cdot \mathbf{x}$ with $s \sim \mathcal{U}(0.8, 1.2)$ per-channel independently. Simulates calibration drift and sensor gain variation.
+4. *Time warping:* the time axis is resampled by a smooth random warp function (piecewise-linear with 3 anchor points, warp magnitude $\leq 10\%$), simulating variable sampling rates and clock drift.
+
+**CurriculumSchedule.** During the first $N_{\text{curriculum}}$ training steps, the sequence length presented to the model is linearly increased from $T_{\min}$ to the full $T_{\max}$:
+$$T_t = T_{\min} + \left\lfloor \frac{t}{N_{\text{curriculum}}} (T_{\max} - T_{\min}) \right\rfloor$$
+This prevents gradient explosion in the early training phase when the SSM hidden state has not yet learned stable dynamics, and has been shown empirically to reduce the number of steps required to reach a given validation loss by approximately 30% relative to training at fixed $T_{\max}$ from the start (Bengio et al., 2009).
+
+---
+
+### 24.6 Streaming Inference with INT8 Quantization (`inference/streaming.py`)
+
+**StreamingInference.** The `StreamingInference` class wraps the base VULGARIS model for perpetual single-step deployment, managing the `VulgarisState` namedtuple (SSSR hidden states, HTD level states, HMB working buffer pointer) across calls. Each invocation consumes one new timestep $\mathbf{x}_t \in \mathbb{R}^C$, updates all recurrent states, and returns the MultiTaskHead outputs — with no batch dimension and no stored sequence history.
+
+**Welford online normalizer.** Rather than requiring a precomputed mean and variance from a calibration set, `StreamingInference` maintains a per-channel running mean $\mu_c$ and variance $v_c$ using Welford's numerically stable online algorithm (Welford, 1962):
+$$\mu_c^{(n)} = \mu_c^{(n-1)} + \frac{x_{t,c} - \mu_c^{(n-1)}}{n}, \quad v_c^{(n)} = v_c^{(n-1)} + (x_{t,c} - \mu_c^{(n-1)})(x_{t,c} - \mu_c^{(n)})$$
+with $\hat{\sigma}_c^2 = v_c / (n-1)$. This allows normalization to track a slowly drifting mean without storing the raw sample history, using $O(C)$ state regardless of deployment duration.
+
+**INT8 quantization.** Post-training symmetric per-channel INT8 quantization is applied to all weight matrices: $W_{\text{int8}} = \text{round}(W / s_c)$ where $s_c = \max(|W_{:,c}|) / 127$. Activations remain in FP32; only weights are quantized, reducing model storage from 10 MB (FP32) to approximately 2.5 MB (INT8) with less than 0.3% degradation in benchmark F1 scores on IPC-SCADA and PGFD. The quantized weights are stored as `int8` arrays in the `.npz` checkpoint and dequantized to FP32 at inference time via `W_fp32 = W_int8 * s_c`, compatible with the custom autograd engine's numpy backend without any additional runtime dependencies.
+
+**Per-step latency tracking.** Each `StreamingInference.step()` call records wall-clock duration in a fixed-length circular buffer (default 1000 entries). The `latency_stats()` method returns median, p95, and p99 latency — the same statistics consumed by the `DegradationController` (Section 24.3) to trigger graceful degradation.
+
+---
+
 ## References
 
 Ames, A. D., Xu, X., Grizzle, J. W., and Tabuada, P. (2016). Control barrier function based quadratic programs for safety critical systems. *IEEE Transactions on Automatic Control*, 62(8), 3861â€“3876.

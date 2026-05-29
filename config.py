@@ -27,6 +27,8 @@ class SSSRConfig:
     n_heads: int = 8
     hebbian_lr: float = 1e-4
     stability_eps: float = 1e-3
+    # MoD routing: fraction of tokens routed through SSM heads (1.0 = all, no overhead)
+    routing_k: float = 1.0
 
 
 @dataclass

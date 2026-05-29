@@ -1,0 +1,82 @@
+ase:
+  dropout: 0.1
+  filter_len: 16
+  latent_dim: 64
+  n_filters: 8
+  n_scales: 4
+crg:
+  dag_lambda: 1.0
+  max_edges: 64
+  n_lags: 5
+  n_nodes: 16
+  sparsity_lambda: 0.05
+  update_interval: 100
+dah:
+  adapter_rank: 8
+  adapter_scale: 0.01
+  meta_dim: 32
+  n_domains: 4
+device: cpu
+dtype: float32
+ese:
+  cf_lr: 0.01
+  cf_steps: 50
+  max_depth: 5
+  max_rules: 16
+  min_samples: 10
+hmb:
+  archive_size: 256
+  buffer_size: 64
+  compress_dim: 16
+  consolidation_interval: 1000
+  embed_dim: 64
+  surprise_threshold: 2.0
+htd:
+  bottleneck_dim: 16
+  n_levels: 4
+  time_constants:
+  - 0.01
+  - 0.1
+  - 1.0
+  - 10.0
+input_dim: 9
+multitask:
+  forecast_horizon: 10
+  n_channels: 1
+n_classes: 5
+output_dim: 5
+safety:
+  cbf_gamma: 0.5
+  certified_radius: 0.1
+  lipschitz_bound: 10.0
+  n_constraints: 8
+shcal:
+  ewc_lambda: 100.0
+  fisher_samples: 50
+  grow_threshold: 0.1
+  plasticity_rate: 0.0001
+  prune_threshold: 0.001
+sssr:
+  d_inner: 128
+  dt_max: 0.1
+  dt_min: 0.001
+  hebbian_lr: 0.0001
+  n_heads: 4
+  routing_k: 1.0
+  stability_eps: 0.001
+  state_dim: 64
+training:
+  batch_size: 16
+  beta_hmb: 0.05
+  checkpoint_dir: D:\Microsoft\Vulgaris\checkpoints\telecom
+  delta_ewc: 0.05
+  epsilon_conformal: 0.05
+  gamma_crg: 0.005
+  grad_clip: 1.0
+  lr: 0.0005
+  max_steps: 2000
+  min_lr: 1.0e-06
+  seq_len: 1024
+  spectral_clip: 2.0
+  warmup_steps: 50
+  weight_decay: 0.01

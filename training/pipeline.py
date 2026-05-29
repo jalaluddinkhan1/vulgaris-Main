@@ -7,6 +7,10 @@ from typing import Dict, Iterator, Optional
 from engine.tensor import Tensor
 from .loss import VulgarisLoss
 from .optimizer import SpectralAdamW, CosineSchedule
+from .distributed import (
+    is_initialized, is_main_process,
+    allreduce_gradients, allreduce_scalar,
+)
 
 
 class TimeSeriesAugment:
@@ -30,12 +34,16 @@ class TimeSeriesAugment:
         scale_range: tuple = (0.8, 1.2),
         time_warp_max: int = 4,
         aug_prob: float = 0.5,
+        spectral_drop_p: float = 0.1,
+        spectral_drop_width: int = 4,
     ):
         self.noise_std = noise_std
         self.channel_dropout_p = channel_dropout_p
         self.scale_range = scale_range
         self.time_warp_max = time_warp_max
         self.aug_prob = aug_prob
+        self.spectral_drop_p = spectral_drop_p
+        self.spectral_drop_width = spectral_drop_width
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         """x: (B, C, T) float32.  Returns augmented copy."""
@@ -65,12 +73,26 @@ class TimeSeriesAugment:
                 if shift != 0:
                     x[b] = np.roll(x[b], shift, axis=-1)
 
+        # Spectral augmentation: randomly zero out a contiguous frequency band
+        # per batch item in the FFT domain. Forces the model to be robust to
+        # missing harmonics — critical for vibration and power signal training.
+        if self.spectral_drop_p > 0 and np.random.rand() < self.aug_prob:
+            X_fft = np.fft.rfft(x, axis=-1)          # (B, C, F) complex
+            n_freqs = X_fft.shape[-1]
+            if n_freqs > self.spectral_drop_width:
+                for b in range(x.shape[0]):
+                    start = np.random.randint(0, n_freqs - self.spectral_drop_width)
+                    drop_ch = np.random.rand(x.shape[1]) < self.spectral_drop_p
+                    X_fft[b, drop_ch, start:start + self.spectral_drop_width] = 0.0
+            x = np.fft.irfft(X_fft, n=x.shape[-1], axis=-1).astype(np.float32)
+
         return x
 
     def __repr__(self) -> str:
         return (f"TimeSeriesAugment(noise_std={self.noise_std}, "
                 f"channel_dropout_p={self.channel_dropout_p}, "
-                f"scale_range={self.scale_range}, aug_prob={self.aug_prob})")
+                f"scale_range={self.scale_range}, aug_prob={self.aug_prob}, "
+                f"spectral_drop_p={self.spectral_drop_p})")
 
 
 class CurriculumSchedule:
@@ -133,6 +155,8 @@ class TrainingPipeline:
         scheduler: CosineSchedule,
         augment: Optional[TimeSeriesAugment] = None,
         curriculum: Optional[CurriculumSchedule] = None,
+        tfc_enabled: bool = False,
+        mae_mask_ratio: float = 0.0,
     ):
         self.model = model
         self.config = config
@@ -144,6 +168,9 @@ class TrainingPipeline:
         self.best_loss: float = float('inf')
         self.augment = augment
         self.curriculum = curriculum
+        # Phase 2: TF-C and MAE pretraining flags
+        self.tfc_enabled = tfc_enabled
+        self.mae_mask_ratio = mae_mask_ratio
 
         checkpoint_dir = getattr(config.training, "checkpoint_dir", "checkpoints")
         self.checkpoint_dir: str = checkpoint_dir
@@ -160,6 +187,9 @@ class TrainingPipeline:
             "cbf_loss":       deque(maxlen=100),
             "cmla_loss":      deque(maxlen=100),
             "conformal_loss": deque(maxlen=100),
+            "tfc_loss":           deque(maxlen=100),
+            "mae_loss":           deque(maxlen=100),
+            "rmc_balance_loss":   deque(maxlen=100),
         }
 
     # ──────────────────────────────────────────────────────────────────────
@@ -191,6 +221,38 @@ class TrainingPipeline:
         # Forward
         output, aux = self.model(x_t, domain_idx=domain_idx)
 
+        # ── TF-C: Time-Frequency Consistency ─────────────────────────────
+        # Encode the frequency-augmented view and pass the pair to the loss.
+        if self.tfc_enabled:
+            x_fft = x.copy()
+            X_f = np.fft.rfft(x_fft, axis=-1)
+            n_freqs = X_f.shape[-1]
+            drop_w = max(1, n_freqs // 8)
+            for b in range(x.shape[0]):
+                st = np.random.randint(0, max(1, n_freqs - drop_w))
+                X_f[b, :, st:st + drop_w] = 0.0
+            x_freq = np.fft.irfft(X_f, n=x.shape[-1], axis=-1).astype(np.float32)
+            x_freq_t = Tensor(x_freq, requires_grad=True)
+            # Encode both views through ASE; mean-pool over time → (B, d_model)
+            x_time_t = Tensor(x.astype(np.float32), requires_grad=True)
+            x_time_norm = self.model.revin.normalize(x_time_t)
+            x_freq_norm = self.model.revin.normalize(x_freq_t)
+            h_time = self.model.ase(x_time_norm)   # (B, T, d_model)
+            h_freq = self.model.ase(x_freq_norm)   # (B, T, d_model)
+            # Mean-pool over T
+            h_time_pool = Tensor(h_time.data.mean(axis=1), requires_grad=h_time.requires_grad,
+                                 _children=(h_time,), _op="tfc_pool_t")
+            h_freq_pool = Tensor(h_freq.data.mean(axis=1), requires_grad=h_freq.requires_grad,
+                                 _children=(h_freq,), _op="tfc_pool_f")
+            aux["tfc_pair"] = (h_time_pool, h_freq_pool)
+
+        # ── MAE reconstruction ────────────────────────────────────────────
+        if self.mae_mask_ratio > 0.0:
+            _, mae_loss, _ = self.model.mae_forward(
+                x_t, mask_ratio=self.mae_mask_ratio, domain_idx=domain_idx
+            )
+            aux["mae_loss"] = mae_loss
+
         # Loss
         total_loss, components = self.loss_fn(output, y_t, aux)
 
@@ -207,6 +269,10 @@ class TrainingPipeline:
             self.optimizer.zero_grad()
             components["total_loss"] = float('inf')
             return components
+
+        # Distributed: synchronise gradients across all ranks before update
+        if is_initialized():
+            allreduce_gradients(self.model.parameters())
 
         # Optimizer step + LR schedule
         self.optimizer.step()
@@ -232,8 +298,13 @@ class TrainingPipeline:
             if k in self.metrics:
                 self.metrics[k].append(float(v))
 
-        # Checkpoint on improvement
+        # Distributed: average reported loss across ranks for consistent logging
         total_val = components.get("total_loss", float('inf'))
+        if is_initialized():
+            total_val = allreduce_scalar(total_val, op="mean")
+            components["total_loss"] = total_val
+
+        # Checkpoint on improvement
         if total_val < self.best_loss:
             self.best_loss = total_val
             self.save_checkpoint(tag="best")
@@ -364,11 +435,51 @@ class TrainingPipeline:
 
     # ──────────────────────────────────────────────────────────────────────
 
+    def active_step(
+        self,
+        x_pool: np.ndarray,
+        x_labeled: np.ndarray,
+        y_labeled: np.ndarray,
+        n_query: int = 10,
+        strategy: str = "uncertainty",
+        domain_idx: int = 0,
+    ) -> dict:
+        """
+        Active learning step: query the most uncertain samples from an unlabeled
+        pool, then run a supervised training step on the already-labeled data.
+
+        x_pool    : (N, C, T) — unlabeled pool (will NOT be labeled here;
+                                caller is responsible for obtaining labels)
+        x_labeled : (B, C, T) — currently labeled training data
+        y_labeled : (B, out_dim) — labels for x_labeled
+        n_query   : number of pool samples to flag for labeling
+        strategy  : "uncertainty", "entropy", "margin", "random"
+
+        Returns:
+            dict with "query_indices" (most uncertain) + train_step metrics.
+        """
+        from .active_learning import ActiveLearner
+
+        learner = ActiveLearner(self.model, strategy=strategy)
+        query_idx = learner.query(x_pool, n_query=n_query, domain_idx=domain_idx)
+
+        # Train on the labeled data that we already have
+        train_metrics = self.train_step(x_labeled, y_labeled, domain_idx=domain_idx)
+        train_metrics["query_indices"] = query_idx.tolist()
+        train_metrics["n_queried"] = int(len(query_idx))
+        return train_metrics
+
+    # ──────────────────────────────────────────────────────────────────────
+
     def save_checkpoint(self, tag: str = 'latest'):
         """
         Save model state_dict, optimizer state, step_count, best_loss.
         Uses numpy .npz format (no pickle).
+        Only rank 0 writes to disk in distributed runs.
         """
+        if is_initialized() and not is_main_process():
+            return   # non-zero ranks skip — rank 0 holds the canonical copy
+
         path = os.path.join(self.checkpoint_dir, f"checkpoint_{tag}.npz")
 
         model_state = self.model.state_dict()

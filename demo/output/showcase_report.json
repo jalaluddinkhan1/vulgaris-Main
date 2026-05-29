@@ -1,0 +1,150 @@
+{
+  "product": "VULGARIS",
+  "tagline": "Streaming causal industrial intelligence \u2014 on-prem, CPU, explainable",
+  "model": {
+    "base_params": 139536,
+    "adapter_params": 138468,
+    "total_params": 278004,
+    "d_model": 64,
+    "input_channels": 9,
+    "channel_names": [
+      "latency_ms",
+      "packet_loss_%",
+      "cpu_load_%",
+      "bandwidth_%",
+      "jitter_ms",
+      "queue_depth",
+      "signal_strength_dBm",
+      "temperature_C",
+      "error_rate"
+    ],
+    "event_classes": {
+      "0": "NORMAL",
+      "1": "CONGESTION",
+      "2": "HW_FAULT",
+      "3": "DDOS",
+      "4": "ROUTING_LOOP"
+    }
+  },
+  "differentiators": [
+    {
+      "capability": "Streaming O(1) state",
+      "vulgaris": "model.step()",
+      "typical_alternative": "Cloud TS FMs need full-window batch / GPU"
+    },
+    {
+      "capability": "Edge CPU deploy",
+      "vulgaris": "Pure NumPy, ~1M params default",
+      "typical_alternative": "Billions-param models, CUDA APIs"
+    },
+    {
+      "capability": "Multi-site one model",
+      "vulgaris": "DAH domain adapters",
+      "typical_alternative": "Separate model per asset"
+    },
+    {
+      "capability": "Causal root cause",
+      "vulgaris": "CRG DAG + Granger updates",
+      "typical_alternative": "Correlation-only anomaly scores"
+    },
+    {
+      "capability": "Rare event memory",
+      "vulgaris": "HMB surprise buffer + VAE archive",
+      "typical_alternative": "No episodic memory"
+    },
+    {
+      "capability": "Explainability",
+      "vulgaris": "ESE CART rules + attribution",
+      "typical_alternative": "Black-box scores"
+    },
+    {
+      "capability": "Expert rules in training",
+      "vulgaris": "Rule engine -> DAH (optional)",
+      "typical_alternative": "Post-hoc filters only"
+    },
+    {
+      "capability": "Safety projection",
+      "vulgaris": "CBF safety head (optional)",
+      "typical_alternative": "Unconstrained outputs"
+    },
+    {
+      "capability": "On-prem / air-gap",
+      "vulgaris": "No PyTorch/cloud dependency",
+      "typical_alternative": "Data leaves the facility"
+    },
+    {
+      "capability": "Continual learning",
+      "vulgaris": "SHCAL EWC + online_adapt",
+      "typical_alternative": "Full retrain pipelines"
+    }
+  ],
+  "training": {
+    "train_seconds": 82.41,
+    "test_accuracy": 0.9556,
+    "n_train": 840,
+    "n_test": 180,
+    "epochs": 6
+  },
+  "streaming": {
+    "steps": 200,
+    "latency_ms_mean": 13.207,
+    "latency_ms_p95": 18.693,
+    "latency_ms_max": 44.517
+  },
+  "domains": {
+    "domains": [
+      {
+        "name": "pop_london",
+        "domain_idx": 3,
+        "metadata": {
+          "region": "eu-west",
+          "role": "core_router"
+        }
+      },
+      {
+        "name": "pop_nyc",
+        "domain_idx": 0,
+        "metadata": {
+          "region": "us-east",
+          "role": "core_router"
+        }
+      },
+      {
+        "name": "fab_line_3",
+        "domain_idx": 1,
+        "metadata": {
+          "region": "on-prem",
+          "role": "process"
+        }
+      }
+    ]
+  },
+  "explainability": {
+    "causal_graph_printed": true,
+    "sample_rules": [],
+    "top_features": [
+      [
+        "feature_49",
+        0.02
+      ],
+      [
+        "feature_48",
+        0.02
+      ],
+      [
+        "feature_47",
+        0.02
+      ],
+      [
+        "feature_46",
+        0.02
+      ],
+      [
+        "feature_45",
+        0.02
+      ]
+    ]
+  },
+  "checkpoint_dir": "D:\\Microsoft\\Vulgaris\\demo\\output\\showcase_checkpoint",
+  "generated_at": "2026-05-29T08:14:44Z"
+}

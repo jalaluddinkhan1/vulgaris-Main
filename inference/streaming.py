@@ -61,9 +61,48 @@ class QuantizedWeights:
         return self.data.astype(np.float32) * self.scale
 
 
+class _PoisoningDetector:
+    """
+    Online Z-score sensor for telemetry poisoning.
+
+    Maintains per-channel running mean/std (EMA).  Any sample with
+    |z-score| > z_thresh is clamped and flagged.
+    """
+
+    def __init__(self, n_channels: int, z_thresh: float = 6.0,
+                 momentum: float = 0.05):
+        self.z_thresh = z_thresh
+        self.momentum = momentum
+        self._mean = np.zeros(n_channels, dtype=np.float64)
+        self._std  = np.ones(n_channels, dtype=np.float64)
+        self._n    = 0
+
+    def check_and_sanitize(self, x: np.ndarray) -> Tuple[np.ndarray, bool]:
+        """x: (batch, channels). Returns (sanitized_x, poisoning_flag)."""
+        if self._n < 30:
+            self._update(x)
+            return x.copy(), False
+
+        z = (x - self._mean) / (self._std + 1e-8)
+        flagged = bool(np.any(np.abs(z) > self.z_thresh))
+        x_clean = np.clip(x,
+                          self._mean - self.z_thresh * self._std,
+                          self._mean + self.z_thresh * self._std)
+        self._update(x_clean)
+        return x_clean, flagged
+
+    def _update(self, x: np.ndarray):
+        a = self.momentum
+        self._mean = (1 - a) * self._mean + a * x.mean(axis=0)
+        self._std  = (1 - a) * self._std  + a * (x.std(axis=0) + 1e-8)
+        self._n   += x.shape[0]
+
+
 class StreamingInference:
     def __init__(self, model: Vulgaris, batch_size: int = 1,
-                 normalize_input: bool = True, mode: str = 'predictive'):
+                 normalize_input: bool = True, mode: str = 'predictive',
+                 z_thresh: float = 6.0,
+                 delta_threshold: Optional[float] = None):
         self.model = model
         self.model.training = False
         self.batch_size = batch_size
@@ -72,20 +111,87 @@ class StreamingInference:
 
         in_channels = model.config.input_dim
         self.normalizer = RunningNormalizer(dim=in_channels)
+        self._poisoning_detector = _PoisoningDetector(in_channels, z_thresh=z_thresh)
         self.state: VulgarisState = model.init_state(batch_size)
         self.latency_buffer: deque = deque(maxlen=100)
         self.step_count: int = 0
         self._quantized_weights: Dict[str, QuantizedWeights] = {}
         self._record_ese: bool = False
         self._use_safety: bool = False
+        self._last_timestamp: Optional[float] = None
+        self._ooo_count: int = 0
+        self._poison_count: int = 0
+        # Delta-threshold event gating: skip forward pass when sensors are static
+        self._delta_threshold: Optional[float] = delta_threshold
+        self._last_x: Optional[np.ndarray] = None
+        self._last_pred: Optional[np.ndarray] = None
+        self._last_uncertainty: float = 0.0
+        self._skipped_count: int = 0
 
-    def step(self, x_t: np.ndarray, domain_idx: int = 0) -> dict:
-        # x_t: (batch, in_channels) single timestep
+    def step(self, x_t: np.ndarray, domain_idx: int = 0,
+             timestamp: Optional[float] = None) -> dict:
+        """
+        x_t       : (batch, in_channels) single timestep
+        timestamp : monotonic sensor timestamp (seconds).  If provided and
+                    smaller than the last seen timestamp, the step is still
+                    processed (event-driven systems can deliver out-of-order)
+                    but `ooo_event=True` is set in the returned dict.
+        """
         t0 = time.perf_counter()
 
+        # --- Malformed packet guard ---
         x = np.asarray(x_t, dtype=np.float64)
         if x.ndim == 1:
-            x = x[None, :]  # (1, in_channels)
+            x = x[None, :]
+
+        expected = self.model.config.input_dim
+        if x.shape[-1] != expected:
+            raise ValueError(
+                f"Input has {x.shape[-1]} channels; model expects {expected}"
+            )
+
+        # NaN / Inf → replace with running mean (safe fallback)
+        bad = ~np.isfinite(x)
+        if bad.any():
+            x = np.where(bad, self.normalizer.mean, x)
+
+        # --- Delta-threshold event gating ---
+        if (self._delta_threshold is not None
+                and self._last_x is not None
+                and self._last_pred is not None
+                and np.abs(x - self._last_x).max() < self._delta_threshold):
+            self._skipped_count += 1
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            self.latency_buffer.append(latency_ms)
+            return {
+                'prediction': self._last_pred.copy(),
+                'uncertainty': self._last_uncertainty,
+                'latency_ms': latency_ms,
+                'step': self.step_count,
+                'ooo_event': False,
+                'poisoning_suspected': False,
+                'skipped': True,
+            }
+
+        # --- Out-of-order timestamp detection ---
+        ooo = False
+        if timestamp is not None:
+            if self._last_timestamp is not None and timestamp < self._last_timestamp:
+                self._ooo_count += 1
+                ooo = True
+            # Always advance to the maximum seen so gaps don't permanently block
+            self._last_timestamp = max(
+                timestamp,
+                self._last_timestamp if self._last_timestamp is not None else timestamp,
+            )
+
+        # --- Telemetry poisoning guard ---
+        x, poisoned = self._poisoning_detector.check_and_sanitize(x)
+        if poisoned:
+            self._poison_count += 1
+
+        # Cache pre-normalization value for delta-threshold gating
+        self._last_x = x.copy()
 
         if self.normalize_input:
             self.normalizer.update(x)
@@ -100,6 +206,8 @@ class StreamingInference:
 
         # Uncertainty: variance across output dimensions as a simple proxy
         uncertainty = float(np.var(pred))
+        self._last_pred = pred
+        self._last_uncertainty = uncertainty
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
         self.latency_buffer.append(latency_ms)
@@ -109,6 +217,9 @@ class StreamingInference:
             'uncertainty': uncertainty,
             'latency_ms': latency_ms,
             'step': self.step_count,
+            'ooo_event': ooo,
+            'poisoning_suspected': poisoned,
+            'skipped': False,
         }
 
     def process_window(self, x_window: np.ndarray, domain_idx: int = 0) -> dict:
@@ -167,6 +278,16 @@ class StreamingInference:
             'p95_ms': float(np.percentile(arr, 95)),
             'p99_ms': float(np.percentile(arr, 99)),
             'max_ms': float(np.max(arr)),
+        }
+
+    def get_health_stats(self) -> dict:
+        """Return security and data-quality counters alongside latency stats."""
+        return {
+            **self.get_latency_stats(),
+            'ooo_events_total': self._ooo_count,
+            'poisoning_events_total': self._poison_count,
+            'steps_processed': self.step_count,
+            'steps_skipped': self._skipped_count,
         }
 
     def quantize_model(self, bits: int = 8):

@@ -1,0 +1,12 @@
+{
+  "vulgaris_version": "0.1.0",
+  "format_version": 1,
+  "saved_at": "2026-05-29T08:14:44Z",
+  "n_base_params": 139536,
+  "n_adapter_params": 138468,
+  "d_model": 64,
+  "input_dim": 9,
+  "output_dim": 5,
+  "n_classes": 5,
+  "weights_sha256": "c9f61932a2bfc1b492fe311d0c49174acb19c2d69cb7e6250c7f1ed3540b1396"
+}

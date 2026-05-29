@@ -16,7 +16,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from serve.auth import require_api_key
 from serve.logging_setup import setup_logging, get_logger
 from serve import metrics as _metrics
-from serve.degradation import DegradationController, DegradationLevel
+from serve.degradation import (
+    CanaryController, DeploymentMode,
+    DegradationController, DegradationLevel,
+)
+from serve.audit import AuditLogger
 from serve.versioning import ModelVersionRegistry
 
 from .streaming import StreamingInference
@@ -31,6 +35,14 @@ from config import ModelConfig
 _log = get_logger("server")
 
 _degradation = DegradationController()
+_canary = CanaryController(mode=DeploymentMode.PRIMARY)
+_audit = AuditLogger(
+    path=os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "audit",
+        "predictions.jsonl",
+    )
+)
 
 _version_registry = ModelVersionRegistry(
     index_path=os.path.join(
@@ -253,6 +265,13 @@ async def predict(req: PredictRequest, request: Request):
                 "ctx_latency_ms": round(latency_s * 1000, 2),
                 "ctx_degradation": deg_level.value,
             },
+        )
+
+        _audit.record(
+            x_raw=data,
+            prediction=np.array(pred_list),
+            step=result["steps"],
+            domain_idx=domain_idx,
         )
 
         return PredictResponse(
@@ -516,6 +535,45 @@ async def counterfactual(req: CounterfactualRequest, request: Request):
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Audit + deployment endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/audit")
+async def audit_tail(request: Request, n: int = 100):
+    _auth_check(request)
+    return {
+        "records": _audit.tail(n),
+        "total_written": _audit.count(),
+    }
+
+
+@app.post("/deployment/mode")
+async def set_deployment_mode(request: Request):
+    _auth_check(request)
+    body = await request.json()
+    raw_mode = body.get("mode", "primary")
+    try:
+        mode = DeploymentMode(raw_mode)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown mode '{raw_mode}'. Valid: primary, canary, shadow",
+        )
+    canary_pct = float(body.get("canary_pct", _canary.canary_pct))
+    _canary.canary_pct = canary_pct
+    _canary.set_mode(mode)
+    _log.info("deployment mode changed", extra={"ctx_mode": mode.value, "ctx_canary_pct": canary_pct})
+    return {"mode": mode.value, "canary_pct": canary_pct}
+
+
+@app.get("/deployment/shadow-stats")
+async def shadow_stats(request: Request):
+    _auth_check(request)
+    return _canary.shadow_stats()
 
 
 # ---------------------------------------------------------------------------

@@ -99,6 +99,19 @@ class DomainAdaptiveHypernetwork(Module):
         object.__setattr__(self, "_current_domain", -1)
         object.__setattr__(self, "_domain_registry", {})   # name -> idx
         object.__setattr__(self, "_next_domain_idx", 0)
+        # Optional rule encoder — set via attach_rule_encoder()
+        object.__setattr__(self, "_rule_encoder", None)
+        object.__setattr__(self, "_rule_registry", None)
+        # Optional ontology embedding — set via attach_ontology_embedding()
+        object.__setattr__(self, "_onto_embed", None)
+        object.__setattr__(self, "_onto_registry", None)
+
+        # OOD detection state (Mahalanobis distance in meta_mlp output space)
+        object.__setattr__(self, "_seen_embeddings", {})   # domain_idx -> z_np (meta_dim,)
+        object.__setattr__(self, "_ood_mean",     None)
+        object.__setattr__(self, "_ood_inv_cov",  None)
+        object.__setattr__(self, "_ood_threshold", None)
+        object.__setattr__(self, "_ood_fitted",   False)
 
         for name, layer in target_layers.items():
             d_out = layer.out_features
@@ -142,14 +155,35 @@ class DomainAdaptiveHypernetwork(Module):
         object.__setattr__(self, "_domain_registry", registry)
         return idx
 
-    def set_domain(self, domain_idx: int):
-        """Compute (or retrieve cached) adapters for domain_idx."""
+    def set_domain(self, domain_idx: int, warn_ood: bool = True):
+        """
+        Compute (or retrieve cached) adapters for domain_idx.
+
+        warn_ood : if True and the OOD detector has been fitted, emits a
+            RuntimeWarning when domain_idx lies outside the training convex
+            hull.  The adapters are still generated — this is a warning, not
+            a hard rejection.  Set warn_ood=False to silence in production
+            if you have accepted this limitation explicitly.
+        """
         if domain_idx == self._current_domain and domain_idx in self._domain_cache:
             return  # fast path
 
         if domain_idx not in self._domain_cache:
             adapters = self._compute_adapters(domain_idx)
             self._domain_cache[domain_idx] = adapters
+
+        if warn_ood and self._ood_fitted:
+            result = self.check_ood(domain_idx)
+            if result["is_ood"]:
+                import warnings
+                warnings.warn(
+                    f"DAH OOD: domain_idx={domain_idx} is outside the training "
+                    f"distribution (Mahalanobis distance {result['distance']:.3f} > "
+                    f"threshold {result['threshold']:.3f}, n_seen={result['n_seen']}). "
+                    f"Adapter outputs may be unreliable.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         object.__setattr__(self, "_current_domain", domain_idx)
 
@@ -158,6 +192,60 @@ class DomainAdaptiveHypernetwork(Module):
         idx_t = Tensor(np.array([domain_idx], dtype=np.int32), requires_grad=False)
         z = self.domain_embed(idx_t)            # (1, meta_dim)
         z = self.meta_mlp(z)                    # (1, meta_dim)
+
+        # Rule-context injection: if a RuleEncoder + RuleRegistry are attached,
+        # add the domain's rule embedding to z so adapters become rule-aware.
+        # This is additive — zero-padded domains see no effect.
+        if self._rule_encoder is not None and self._rule_registry is not None:
+            enc = self._rule_registry.encode_domain(domain_idx)   # (max_rules, rule_dim) numpy
+            z_rule = self._rule_encoder.forward(enc)               # (1, meta_dim) Tensor
+            z_data = z.data + z_rule.data                          # broadcast add
+            z = Tensor(z_data, requires_grad=z.requires_grad,
+                       _children=(z, z_rule), _op="rule_inject")
+
+            _z_orig, _z_rule = z._prev
+
+            def _rule_inject_back():
+                if z.grad is None:
+                    return
+                if _z_orig.requires_grad:
+                    _z_orig.grad = (_z_orig.grad + z.grad
+                                    if _z_orig.grad is not None else z.grad.copy())
+                if _z_rule.requires_grad:
+                    _z_rule.grad = (_z_rule.grad + z.grad
+                                    if _z_rule.grad is not None else z.grad.copy())
+
+            z._backward = _rule_inject_back
+
+        # Ontology context injection: if an OntologyEmbedding + OntologyRegistry
+        # are attached, add the domain's ontology vector to z.
+        if self._onto_embed is not None and self._onto_registry is not None:
+            z_onto = self._onto_registry.encode_domain_vec(
+                self._onto_embed, domain_idx
+            )                                                # (1, meta_dim) Tensor
+            z_data = z.data + z_onto.data
+            z = Tensor(z_data, requires_grad=z.requires_grad,
+                       _children=(z, z_onto), _op="onto_inject")
+
+            _z_base, _z_onto = z._prev
+
+            def _onto_inject_back():
+                if z.grad is None:
+                    return
+                if _z_base.requires_grad:
+                    _z_base.grad = (_z_base.grad + z.grad
+                                    if _z_base.grad is not None else z.grad.copy())
+                if _z_onto.requires_grad:
+                    _z_onto.grad = (_z_onto.grad + z.grad
+                                    if _z_onto.grad is not None else z.grad.copy())
+
+            z._backward = _onto_inject_back
+
+        # Record embedding for OOD calibration (invalidate fit on new domain)
+        seen = dict(self._seen_embeddings)
+        seen[domain_idx] = z.data[0].copy()
+        object.__setattr__(self, "_seen_embeddings", seen)
+        object.__setattr__(self, "_ood_fitted", False)
 
         result = {}
         for name in self._layer_names:
@@ -179,10 +267,126 @@ class DomainAdaptiveHypernetwork(Module):
 
         return result
 
+    def attach_ontology_embedding(self, embed, registry) -> None:
+        """
+        Wire an OntologyEmbedding + OntologyRegistry into DAH.
+
+        After this call, every `_compute_adapters` run will add the domain's
+        ontology context vector to z, making adapters semantic-sensor-aware.
+
+        Parameters
+        ----------
+        embed    : OntologyEmbedding instance (meta_dim must match DAHConfig.meta_dim)
+        registry : OntologyRegistry with an `encode_domain_vec(embed, domain_idx)`
+                   convenience method (see OntologyRegistry.encode_domain_vec)
+        """
+        object.__setattr__(self, "_onto_embed", embed)
+        object.__setattr__(self, "_onto_registry", registry)
+        self.clear_cache()
+
+    def attach_rule_encoder(self, encoder, registry) -> None:
+        """
+        Wire a RuleEncoder + RuleRegistry into DAH.
+
+        After this call, every `_compute_adapters` run will add the domain's
+        rule context vector to the meta_mlp output z, so the hypernetwork
+        generates rule-aware adapter weights.
+
+        Parameters
+        ----------
+        encoder  : RuleEncoder instance (meta_dim must match DAHConfig.meta_dim)
+        registry : RuleRegistry instance populated with per-domain rules
+        """
+        object.__setattr__(self, "_rule_encoder", encoder)
+        object.__setattr__(self, "_rule_registry", registry)
+        self.clear_cache()   # invalidate old adapters
+
     def clear_cache(self):
         """Clear adapter cache so hypernetwork is recomputed on next set_domain call."""
         object.__setattr__(self, "_domain_cache", {})
         object.__setattr__(self, "_current_domain", -1)
+
+    # ------------------------------------------------------------------
+    # OOD detection
+    # ------------------------------------------------------------------
+
+    def fit_ood_detector(self, threshold_percentile: float = 95.0) -> bool:
+        """
+        Fit a Mahalanobis-distance OOD detector on all domain embeddings seen
+        so far (i.e., the convex hull of training-time domains).
+
+        Call this once after training / after registering all known domains.
+        Returns True if the fit succeeded (requires >= 4 seen domains).
+
+        threshold_percentile : distance percentile of seen embeddings used as
+            the OOD boundary.  95 means 5% of training domains will be flagged
+            as borderline; increase to 99 for a looser boundary.
+        """
+        seen = self._seen_embeddings
+        if len(seen) < 4:
+            return False
+
+        Z = np.stack(list(seen.values()), axis=0)   # (n, meta_dim)
+        mean = Z.mean(axis=0)
+        # Ridge-regularised covariance so inv is stable even with few domains
+        cov = np.cov(Z.T) + 1e-4 * np.eye(Z.shape[1])
+        try:
+            inv_cov = np.linalg.inv(cov)
+        except np.linalg.LinAlgError:
+            inv_cov = np.linalg.pinv(cov)
+
+        # Calibrate threshold from seen embeddings' own distances
+        diffs = Z - mean                                             # (n, d)
+        dists = np.sqrt(np.einsum("nd,dd,nd->n", diffs, inv_cov, diffs))
+        threshold = float(np.percentile(dists, threshold_percentile))
+
+        object.__setattr__(self, "_ood_mean",     mean)
+        object.__setattr__(self, "_ood_inv_cov",  inv_cov)
+        object.__setattr__(self, "_ood_threshold", threshold)
+        object.__setattr__(self, "_ood_fitted",   True)
+        return True
+
+    def check_ood(self, domain_idx: int) -> dict:
+        """
+        Check whether `domain_idx` falls outside the training distribution.
+
+        Lazily fits the detector on first call if not already fitted.
+
+        Returns
+        -------
+        dict with keys:
+          is_ood    : bool   — True if distance > fitted threshold
+          distance  : float  — Mahalanobis distance in meta_mlp output space
+          threshold : float  — fitted boundary (0.0 if detector not ready)
+          n_seen    : int    — number of domains used to fit the detector
+        """
+        if not self._ood_fitted:
+            self.fit_ood_detector()
+
+        n_seen = len(self._seen_embeddings)
+        if not self._ood_fitted:
+            # Not enough data yet — conservative: do not flag
+            return {"is_ood": False, "distance": 0.0,
+                    "threshold": 0.0, "n_seen": n_seen}
+
+        # Get embedding: use cached version or compute fresh
+        if domain_idx in self._seen_embeddings:
+            z_np = self._seen_embeddings[domain_idx]
+        else:
+            idx_t = Tensor(np.array([domain_idx], dtype=np.int32), requires_grad=False)
+            z = self.meta_mlp(self.domain_embed(idx_t))
+            z_np = z.data[0]
+
+        diff = z_np - self._ood_mean
+        dist = float(np.sqrt(diff @ self._ood_inv_cov @ diff))
+        threshold = float(self._ood_threshold)
+
+        return {
+            "is_ood":    dist > threshold,
+            "distance":  dist,
+            "threshold": threshold,
+            "n_seen":    n_seen,
+        }
 
     def get_adapters(self, domain_idx: int) -> Dict[str, Tuple[Tensor, Tensor]]:
         """Return {layer_name: (A, B)} for all target layers."""

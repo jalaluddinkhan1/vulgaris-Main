@@ -191,11 +191,14 @@ class SelectiveSSR(Module):
         self.state_dim = config.state_dim
         self.dt_min = config.dt_min
         self.dt_max = config.dt_max
+        self.routing_k = float(getattr(config, "routing_k", 1.0))
 
         # Expansion branch
         self.x_proj = Linear(d_model, config.d_inner)
         # Gating branch
         self.z_proj = Linear(d_model, d_model)
+        # MoD routing: scalar score per token; None when routing_k == 1.0 (disabled)
+        self.routing_proj = Linear(d_model, 1, bias=False) if self.routing_k < 1.0 else None
 
         # Causal depthwise conv on expansion: kernel=4, causal padding = kernel-1 on left
         self.conv_kernel = 4
@@ -286,6 +289,35 @@ class SelectiveSSR(Module):
         if h_states is None:
             h_states = [None] * self.n_heads
 
+        # ── MoD routing (Mixture of Depths) ──────────────────────────────
+        # Compute per-token routing scores and select top-k tokens to process
+        # through SSM heads; unselected tokens pass through as identity.
+        # Skipped when routing_k == 1.0 (default) for zero overhead.
+        route_mask = None   # (B, T) hard mask or None
+        if self.routing_proj is not None and self.routing_k < 1.0:
+            from engine.ops import differentiable_topk
+            scores = self.routing_proj(x)          # (B, T, 1)
+            scores_2d = Tensor(
+                scores.data[:, :, 0],
+                requires_grad=scores.requires_grad,
+                _children=(scores,),
+                _op="route_squeeze"
+            )
+            _sc3, _sc2 = scores, scores_2d
+
+            def _sq_back():
+                if _sc3.requires_grad and _sc2.grad is not None:
+                    contrib = _sc2.grad[:, :, None]
+                    _sc3.grad = _sc3.grad + contrib if _sc3.grad is not None else contrib
+
+            scores_2d._backward = _sq_back
+
+            k_tokens = max(1, int(self.routing_k * T))
+            # Flatten (B, T) → process jointly so routing is per-batch-item
+            # soft_mask: (B, T) differentiable weights; hard_mask: (B, T) 0/1
+            soft_mask, hard_mask = differentiable_topk(scores_2d, k=k_tokens)
+            route_mask = hard_mask.data   # (B, T)
+
         # Expansion and causal conv
         u = self.x_proj(x)               # (B, T, d_inner)
         u = self._causal_conv(u)          # (B, T, d_inner)
@@ -299,7 +331,6 @@ class SelectiveSSR(Module):
 
         for i in range(self.n_heads):
             head = self._get_head(i)
-            # Slice the i-th chunk: (B, T, head_dim)
             start = i * self.head_dim
             end = start + self.head_dim
             u_i_data = u.data[:, :, start:end]
@@ -328,6 +359,30 @@ class SelectiveSSR(Module):
 
         # Gated output: y_ssm * silu(z)
         gated = y_ssm * z.silu()            # (B, T, d_model)
+
+        # Apply MoD mask: zero out SSM contribution for unrouted tokens
+        # so they rely entirely on the skip connection
+        if route_mask is not None:
+            mask_3d = route_mask[:, :, None]   # (B, T, 1) broadcast over d_model
+            gated_data = gated.data * mask_3d
+            gated = Tensor(
+                gated_data,
+                requires_grad=gated.requires_grad,
+                _children=(gated,),
+                _op="mod_mask"
+            )
+            _gated_orig = gated._prev[0]
+            _mask_3d = mask_3d
+
+            def _mod_back():
+                if _gated_orig.requires_grad and gated.grad is not None:
+                    _gated_orig.grad = (
+                        _gated_orig.grad + gated.grad * _mask_3d
+                        if _gated_orig.grad is not None
+                        else gated.grad * _mask_3d
+                    )
+
+            gated._backward = _mod_back
 
         # Skip connection
         skip = self.skip_proj(x)            # (B, T, d_model)

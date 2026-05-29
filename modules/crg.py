@@ -1,16 +1,25 @@
 import numpy as np
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from engine.tensor import Tensor, Parameter
 from engine.module import Module
 from engine.layers import Linear
 from config import CRGConfig
 
+# Edge type labels stored alongside active edges
+EDGE_CAUSAL      = "causal"
+EDGE_ASSOCIATIVE = "associative"
+
 
 class CausalRoutingGraph(Module):
     """
     Sparse DAG routing: O(E) compute with Granger-based online structure discovery.
     Differentiable message passing + NOTEARS penalty for acyclicity.
+
+    Spurious-causality guard: after each `update_structure` call, edges whose
+    partial correlation (conditioning on the top-2 common drivers) drops below
+    `ci_threshold` are relabelled as "associative" and zeroed from W so they
+    cannot influence message passing.
     """
 
     def __init__(self, d_model: int, config: CRGConfig):
@@ -22,6 +31,8 @@ class CausalRoutingGraph(Module):
         self.n_lags = config.n_lags
         self.update_interval = config.update_interval
         self.edge_threshold = 0.01
+        # Partial-correlation threshold for causal vs associative labelling
+        self.ci_threshold: float = getattr(config, "ci_threshold", 0.05)
 
         # Adjacency matrix: W_ij = edge strength from node i to node j
         w_init = np.random.randn(config.n_nodes, config.n_nodes).astype(np.float64) * 0.01
@@ -35,6 +46,108 @@ class CausalRoutingGraph(Module):
         object.__setattr__(self, "step_counter", 0)
         object.__setattr__(self, "granger_accumulator",
                            np.zeros((config.n_nodes, config.n_nodes), dtype=np.float64))
+        # edge_labels[i][j] = EDGE_CAUSAL | EDGE_ASSOCIATIVE
+        object.__setattr__(self, "edge_labels", {})
+
+    # ------------------------------------------------------------------
+    # Conditional independence / spurious causality
+    # ------------------------------------------------------------------
+
+    def _partial_correlation(
+        self, x: np.ndarray, i: int, j: int, cond: List[int]
+    ) -> float:
+        """
+        Partial correlation of columns i and j conditioned on `cond` columns.
+
+        Uses the residual approach: regress i and j on `cond`, then correlate
+        the residuals.  Returns a value in [-1, 1]; |value| near 0 means
+        conditional independence.
+
+        x : (T, N) float64
+        """
+        T = x.shape[0]
+        if T < len(cond) + 4:
+            return 1.0   # too little data — conservatively keep edge
+
+        xi = x[:, i]
+        xj = x[:, j]
+
+        if not cond:
+            # Marginal correlation
+            xi_dm = xi - xi.mean()
+            xj_dm = xj - xj.mean()
+            denom = (np.std(xi_dm) * np.std(xj_dm) + 1e-8)
+            return float(np.mean(xi_dm * xj_dm) / denom)
+
+        Z = x[:, cond]                        # (T, k)
+        ZtZ = Z.T @ Z + 1e-6 * np.eye(len(cond))
+        ZtZi = np.linalg.inv(ZtZ)
+
+        # Residualise i and j on Z
+        beta_i = ZtZi @ (Z.T @ xi)
+        beta_j = ZtZi @ (Z.T @ xj)
+        ri = xi - Z @ beta_i
+        rj = xj - Z @ beta_j
+
+        ri_dm = ri - ri.mean()
+        rj_dm = rj - rj.mean()
+        denom = np.std(ri_dm) * np.std(rj_dm) + 1e-8
+        return float(np.mean(ri_dm * rj_dm) / denom)
+
+    def _top_confounders(self, x: np.ndarray, i: int, j: int, k: int = 2) -> List[int]:
+        """
+        Return the k node indices (excluding i, j) whose time-series are most
+        correlated with both x[:, i] and x[:, j].  These are the conditioning
+        set used for the CI test.
+        """
+        N = x.shape[1]
+        exclude = {i, j}
+        scores = []
+        for c in range(N):
+            if c in exclude:
+                continue
+            xi = x[:, i] - x[:, i].mean()
+            xj = x[:, j] - x[:, j].mean()
+            xc = x[:, c] - x[:, c].mean()
+            std_c = np.std(xc) + 1e-8
+            std_i = np.std(xi) + 1e-8
+            std_j = np.std(xj) + 1e-8
+            r_ic = float(np.mean(xi * xc)) / (std_i * std_c)
+            r_jc = float(np.mean(xj * xc)) / (std_j * std_c)
+            # Score = harmonic mean of |r_ic| and |r_jc|: high if correlated with both
+            score = 2 * abs(r_ic) * abs(r_jc) / (abs(r_ic) + abs(r_jc) + 1e-8)
+            scores.append((c, score))
+        scores.sort(key=lambda t: t[1], reverse=True)
+        return [c for c, _ in scores[:k]]
+
+    def _prune_spurious_edges(self, x_history: np.ndarray):
+        """
+        For every active edge (i→j), run a conditional independence test
+        conditioning on the top-2 confounders.  If the partial correlation
+        |r_ij|z| < ci_threshold, zero out W[i, j] and label the edge
+        EDGE_ASSOCIATIVE; otherwise label it EDGE_CAUSAL.
+
+        x_history : (T, N) float64
+        """
+        W_data = self.W.data
+        labels: Dict[Tuple[int, int], str] = {}
+
+        rows, cols = np.where(np.abs(W_data) > self.edge_threshold)
+        for i, j in zip(rows.tolist(), cols.tolist()):
+            if i == j:
+                continue
+            confounders = self._top_confounders(x_history, i, j, k=2)
+            pcorr = self._partial_correlation(x_history, i, j, confounders)
+            if abs(pcorr) < self.ci_threshold:
+                W_data[i, j] = 0.0
+                labels[(i, j)] = EDGE_ASSOCIATIVE
+            else:
+                labels[(i, j)] = EDGE_CAUSAL
+
+        object.__setattr__(self, "edge_labels", labels)
+        np.fill_diagonal(W_data, 0.0)
+
+    # ------------------------------------------------------------------
 
     def _dag_penalty(self) -> Tensor:
         from scipy.linalg import expm as scipy_expm
@@ -119,6 +232,16 @@ class CausalRoutingGraph(Module):
         l1 = self.W.abs().sum() * self.sparsity_lambda
         total_penalty = dag_pen * self.dag_lambda + l1
 
+        # CRG collapse guard: reset W if NaN/Inf contamination detected
+        if not np.all(np.isfinite(self.W.data)):
+            w_reset = np.random.randn(self.n_nodes, self.n_nodes) * 0.01
+            np.fill_diagonal(w_reset, 0.0)
+            self.W.data[:] = w_reset
+            if self.W.grad is not None:
+                self.W.grad[:] = 0.0
+            object.__setattr__(self, "granger_accumulator",
+                               np.zeros((self.n_nodes, self.n_nodes), dtype=np.float64))
+
         # Online structure discovery (every update_interval steps, training only)
         if self.training:
             object.__setattr__(self, "step_counter", self.step_counter + 1)
@@ -171,6 +294,9 @@ class CausalRoutingGraph(Module):
         self.W.data += lr_struct * (new_acc - np.abs(self.W.data))
         np.fill_diagonal(self.W.data, 0.0)
 
+        # Conditional independence pruning: remove spurious correlational edges
+        self._prune_spurious_edges(x_history)
+
     def explain(self, query_node_idx: int) -> List[Tuple[int, float]]:
         """
         Trace influential predecessors of query_node via BFS over strongest edges.
@@ -209,13 +335,156 @@ class CausalRoutingGraph(Module):
         results.sort(key=lambda t: t[1], reverse=True)
         return results
 
-    def get_active_edges(self) -> List[Tuple[int, int, float]]:
-        """Returns list of (i, j, weight) for |W_ij| > edge_threshold."""
+    # ------------------------------------------------------------------
+    # do-calculus intervention API
+    # ------------------------------------------------------------------
+
+    def intervene(
+        self,
+        node_interventions: Dict[int, float],
+        x: Tensor,
+    ) -> Tensor:
+        """
+        Pearl do-calculus intervention: do(X_i = v_i for i in node_interventions).
+
+        Per do-calculus, setting X_i = v_i means:
+          1. All incoming edges to node i are severed (the value is externally
+             forced, not caused by its parents).
+          2. Outgoing edges from i are kept — the intervention propagates forward.
+
+        This is implemented by:
+          - Projecting x to node space.
+          - Overwriting the intervened node values with the given constants.
+          - Running message passing with a modified adjacency that has the
+            columns corresponding to intervened nodes zeroed (no incoming flow).
+          - Projecting back to d_model.
+
+        Args:
+            node_interventions : {node_idx: value} — nodes to force and their values
+            x                  : (B, T, d_model) input Tensor
+
+        Returns:
+            (B, T, d_model) output under the intervention — the counterfactual
+            predicted representation if the intervened nodes had been as specified.
+        """
+        # Project to node space (no grad needed for intervention analysis)
+        node_states_np = self.node_embed(x).data.copy()   # (B, T, n_nodes)
+
+        # Sever incoming edges for intervened nodes
+        W_do = self.W.data.copy()
+        for node_idx in node_interventions:
+            W_do[:, node_idx] = 0.0          # zero the column → no incoming
+        np.fill_diagonal(W_do, 0.0)
+        W_do_sparse = np.where(np.abs(W_do) > self.edge_threshold, W_do, 0.0)
+
+        # Overwrite intervened node values across all (batch, time) positions
+        for node_idx, value in node_interventions.items():
+            node_states_np[:, :, node_idx] = float(value)
+
+        # Message passing under intervention
+        node_states_do = Tensor(node_states_np, requires_grad=False)
+        updated = node_states_do + Tensor(node_states_np @ W_do_sparse,
+                                          requires_grad=False)
+
+        # Project back to d_model
+        return self.node_out(updated)   # (B, T, d_model)
+
+    def counterfactual_root_cause(
+        self,
+        x: Tensor,
+        target_node: int,
+        candidate_nodes: Optional[List[int]] = None,
+        intervention_values: Optional[Dict[int, float]] = None,
+        top_k: int = 5,
+    ) -> dict:
+        """
+        Root-cause analysis via do-calculus: identify which upstream nodes,
+        when intervened upon, most change the activation of `target_node`.
+
+        For each candidate upstream node i, we:
+          1. Set node i to 0 (ablation) and measure the change in target_node.
+          2. Set node i to its observed mean + 2σ (activation) and measure the change.
+        The node with the largest |Δtarget| is the strongest root cause.
+
+        Args:
+            x                   : (B, T, d_model) input Tensor
+            target_node         : index of the node whose activation we study
+            candidate_nodes     : nodes to test (default: all predecessors of target)
+            intervention_values : custom intervention values per node
+                                  (default: ablation to 0)
+            top_k               : number of top causes to return
+
+        Returns:
+            dict with keys:
+              "ranked_causes" : list of {node, delta_activation, direction} sorted
+                                by |delta_activation| descending
+              "target_node"   : target_node index
+              "n_candidates"  : number of nodes tested
+        """
+        # Observed activation of target node under no intervention
+        node_states_obs = self.node_embed(x).data   # (B, T, n_nodes)
+        W_sparse = np.where(np.abs(self.W.data) > self.edge_threshold,
+                            self.W.data, 0.0)
+        updated_obs = node_states_obs + node_states_obs @ W_sparse
+        target_obs = float(updated_obs[:, :, target_node].mean())
+
+        # Determine candidate nodes (predecessors in graph)
+        if candidate_nodes is None:
+            # All nodes with a path to target_node (incoming edges)
+            ancestors = set()
+            queue = [target_node]
+            visited = {target_node}
+            while queue:
+                node = queue.pop()
+                for src in range(self.n_nodes):
+                    if src != node and abs(W_sparse[src, node]) > self.edge_threshold:
+                        if src not in visited:
+                            ancestors.add(src)
+                            visited.add(src)
+                            queue.append(src)
+            candidate_nodes = list(ancestors) if ancestors else list(range(self.n_nodes))
+            candidate_nodes = [n for n in candidate_nodes if n != target_node]
+
+        # For each candidate, ablate (set to 0) and measure delta
+        results = []
+        for node_idx in candidate_nodes:
+            iv = intervention_values.get(node_idx, 0.0) if intervention_values else 0.0
+            # Re-project to node space to read target_node under intervention
+            node_states_do = self.node_embed(x).data.copy()
+            node_states_do[:, :, node_idx] = iv
+            W_do = W_sparse.copy()
+            W_do[:, node_idx] = 0.0
+            updated_do = node_states_do + node_states_do @ W_do
+            target_do = float(updated_do[:, :, target_node].mean())
+            delta = target_do - target_obs
+            results.append({
+                "node":             node_idx,
+                "delta_activation": round(delta, 6),
+                "direction":        "up" if delta > 0 else "down",
+            })
+
+        results.sort(key=lambda r: abs(r["delta_activation"]), reverse=True)
+
+        return {
+            "ranked_causes": results[:top_k],
+            "target_node":   target_node,
+            "target_obs_activation": round(target_obs, 6),
+            "n_candidates":  len(candidate_nodes),
+        }
+
+    def get_active_edges(self) -> List[Tuple[int, int, float, str]]:
+        """Returns list of (i, j, weight, label) for |W_ij| > edge_threshold.
+
+        `label` is 'causal' or 'associative' (set after update_structure).
+        Newly added edges before the first CI test carry label 'causal'.
+        """
         W_data = self.W.data
+        labels: Dict[Tuple[int, int], str] = self.edge_labels
         edges = []
         rows, cols = np.where(np.abs(W_data) > self.edge_threshold)
         for i, j in zip(rows.tolist(), cols.tolist()):
             if i != j:
-                edges.append((int(i), int(j), float(W_data[i, j])))
+                lbl = labels.get((i, j), EDGE_CAUSAL)
+                edges.append((int(i), int(j), float(W_data[i, j]), lbl))
         edges.sort(key=lambda t: abs(t[2]), reverse=True)
         return edges

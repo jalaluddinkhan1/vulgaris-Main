@@ -35,6 +35,93 @@ class VulgarisLoss(Module):
             forgetting_factor=0.01,
             max_calibration_size=2000,
         )
+        self.lambda_tfc  = 0.01   # Time-Frequency Consistency weight
+        self.lambda_mae  = 0.1    # MAE reconstruction weight
+        self.lambda_rmc  = 0.01   # Regime Mixture Core load-balancing weight
+
+    # ──────────────────────────────────────────────────────────────────────
+
+    def tfc_loss(self, h_time: Tensor, h_freq: Tensor,
+                 temperature: float = 0.1) -> Tensor:
+        """
+        Time-Frequency Consistency (TF-C) contrastive loss.
+
+        Encodes two views of the same signal — one from the time domain
+        (h_time) and one from a frequency-augmented view (h_freq) — and
+        maximises their cosine similarity (NT-Xent in a batch of B pairs).
+
+        h_time, h_freq: (B, d_model)  — mean-pooled latent representations
+
+        L_TFC = -1/B * sum_i log [ exp(sim(t_i,f_i)/T) /
+                                   sum_j exp(sim(t_i,f_j)/T) ]
+
+        Reference: Zhang et al. 2022 — "Self-Supervised Contrastive Pre-Training
+        for Time Series via Time-Frequency Consistency"
+        """
+        B = h_time.data.shape[0]
+        if B < 2:
+            return Tensor(np.array([[0.0]]), requires_grad=False)
+
+        # L2-normalise both views
+        norm_t = np.linalg.norm(h_time.data, axis=-1, keepdims=True) + 1e-8
+        norm_f = np.linalg.norm(h_freq.data, axis=-1, keepdims=True) + 1e-8
+        z_t = h_time.data / norm_t   # (B, d_model)
+        z_f = h_freq.data / norm_f   # (B, d_model)
+
+        # Similarity matrix: (B, B) — sim(t_i, f_j)
+        sim = (z_t @ z_f.T) / temperature   # (B, B)
+
+        # NT-Xent: each diagonal is the positive pair
+        sim_max = sim.max(axis=-1, keepdims=True)
+        exp_sim = np.exp(sim - sim_max)
+        log_sum_exp = np.log(exp_sim.sum(axis=-1, keepdims=True) + 1e-12) + sim_max
+        diag_sim = sim[np.arange(B), np.arange(B)]
+        loss_val = float((-diag_sim + log_sum_exp.squeeze(-1)).mean())
+
+        tfc_t = Tensor(
+            np.array([[loss_val]], dtype=np.float64),
+            requires_grad=h_time.requires_grad or h_freq.requires_grad,
+            _children=(h_time, h_freq),
+            _op="tfc_loss"
+        )
+
+        _h_t, _h_f = h_time, h_freq
+        _z_t, _z_f = z_t, z_f
+        _sim, _exp_sim, _log_sum_exp, _B = sim, exp_sim, log_sum_exp, B
+        _norm_t, _norm_f = norm_t, norm_f
+        _temperature = temperature
+
+        def _tfc_back():
+            if tfc_t.grad is None:
+                return
+            g_scale = float(tfc_t.grad.sum()) / _B
+
+            # d_loss / d_sim[i,j] = (-1[i==j] + softmax[i,j]) / B
+            softmax = _exp_sim / (_exp_sim.sum(axis=-1, keepdims=True) + 1e-12)
+            d_sim = softmax.copy()
+            d_sim[np.arange(_B), np.arange(_B)] -= 1.0
+            d_sim = d_sim * g_scale / _temperature  # (B, B)
+
+            # Gradient of sim = z_t @ z_f.T w.r.t. z_t and z_f (normalised)
+            d_z_t = d_sim @ _z_f       # (B, d_model)
+            d_z_f = d_sim.T @ _z_t    # (B, d_model)
+
+            # Chain through L2-normalisation: d/dx (x/||x||) = (I - xx^T/||x||^2)/||x||
+            def _norm_grad(x_raw, z_norm, d_z, norms):
+                n2 = (norms ** 2)
+                # d_x = (d_z - (d_z * z_norm).sum(-1, keepdims=True) * z_norm) / norms
+                proj = (d_z * z_norm).sum(axis=-1, keepdims=True) * z_norm
+                return (d_z - proj) / norms
+
+            if _h_t.requires_grad:
+                d_ht = _norm_grad(_h_t.data, _z_t, d_z_t, _norm_t)
+                _h_t.grad = _h_t.grad + d_ht if _h_t.grad is not None else d_ht
+            if _h_f.requires_grad:
+                d_hf = _norm_grad(_h_f.data, _z_f, d_z_f, _norm_f)
+                _h_f.grad = _h_f.grad + d_hf if _h_f.grad is not None else d_hf
+
+        tfc_t._backward = _tfc_back
+        return tfc_t
 
     # ──────────────────────────────────────────────────────────────────────
 
@@ -205,6 +292,40 @@ class VulgarisLoss(Module):
             l_contrastive = Tensor(np.array([[0.0]]), requires_grad=False)
             components["cmla_loss"] = 0.0
 
+        # ── TF-C: Time-Frequency Consistency ─────────────────────────────
+        # aux["tfc_pair"] = (h_time, h_freq) — mean-pooled latents from
+        # time-domain and frequency-augmented views of the same batch.
+        # Computed in the training pipeline before the forward pass.
+        tfc_pair = aux.get("tfc_pair", None)
+        if tfc_pair is not None:
+            h_time, h_freq = tfc_pair
+            l_tfc = self.tfc_loss(h_time, h_freq)
+            components["tfc_loss"] = float(l_tfc.data.sum())
+        else:
+            l_tfc = Tensor(np.array([[0.0]]), requires_grad=False)
+            components["tfc_loss"] = 0.0
+
+        # ── MAE reconstruction ────────────────────────────────────────────
+        # aux["mae_loss"] = scalar Tensor from model.mae_forward().
+        mae_raw = aux.get("mae_loss", None)
+        if mae_raw is not None and isinstance(mae_raw, Tensor):
+            l_mae = mae_raw
+            components["mae_loss"] = float(mae_raw.data.sum())
+        else:
+            l_mae = Tensor(np.array([[0.0]]), requires_grad=False)
+            components["mae_loss"] = 0.0
+
+        # ── RMC load-balancing ────────────────────────────────────────────
+        # aux["rmc_balance_loss"] written by Vulgaris.forward().
+        rmc_raw = aux.get("rmc_balance_loss", None)
+        if isinstance(rmc_raw, (int, float)):
+            l_rmc = Tensor(np.array([[float(rmc_raw)]], dtype=np.float64),
+                           requires_grad=False)
+            components["rmc_balance_loss"] = float(rmc_raw)
+        else:
+            l_rmc = Tensor(np.array([[0.0]]), requires_grad=False)
+            components["rmc_balance_loss"] = 0.0
+
         # ── Total ─────────────────────────────────────────────────────────
         total = (
             l_task
@@ -215,6 +336,9 @@ class VulgarisLoss(Module):
             + l_cbf         * self.zeta
             + l_temporal    * self.eta
             + l_contrastive * self.theta
+            + l_tfc         * self.lambda_tfc
+            + l_mae         * self.lambda_mae
+            + l_rmc         * self.lambda_rmc
         )
         components["total_loss"] = float(total.data.sum())
 

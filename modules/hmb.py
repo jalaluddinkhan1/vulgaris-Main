@@ -186,19 +186,35 @@ class HierarchicalMemoryBank(Module):
     # ------------------------------------------------------------------
     def _archive_entry(self, h_np: np.ndarray, uncertainty: float,
                        timestamp: int, tag: str):
-        """Compress h_np via VAE and store in archive, evicting LRU if full."""
-        h_t = Tensor(h_np[None, :], requires_grad=False)      # (1, D)
-        mu, logvar = self.vae.encode(h_t)
-        h_z = mu.data[0].copy()                                # (compress_dim,)
+        """Compress h_np via VAE and store in archive, evicting LRU if full.
+
+        Corrupted-entry guard: if the VAE encode raises or returns non-finite
+        values, falls back to a zero vector so the archive remains consistent.
+
+        Memory-pressure eviction priority: low-uncertainty entries are evicted
+        first (they are cheaply re-learned), then by LRU within the same tier.
+        High-uncertainty (high-surprise) entries are retained the longest.
+        """
+        try:
+            h_t = Tensor(h_np[None, :], requires_grad=False)      # (1, D)
+            mu, logvar = self.vae.encode(h_t)
+            h_z = mu.data[0].copy()                                # (compress_dim,)
+            if not np.all(np.isfinite(h_z)):
+                h_z = np.zeros(self.compress_dim, dtype=np.float64)
+        except Exception:
+            h_z = np.zeros(self.compress_dim, dtype=np.float64)
 
         archive = self.archive
         if len(archive) >= self.archive_size:
-            # Evict least recently accessed (smallest timestamp + lowest access_count)
-            lru_tag = min(
+            # Eviction order: low-uncertainty first, then oldest + least accessed
+            evict_tag = min(
                 archive.keys(),
-                key=lambda k: archive[k]["timestamp"] + archive[k]["access_count"]
+                key=lambda k: (
+                    archive[k]["uncertainty"],
+                    archive[k]["timestamp"] + archive[k]["access_count"],
+                )
             )
-            del archive[lru_tag]
+            del archive[evict_tag]
 
         archive[tag] = {
             "h_z": h_z,
@@ -232,15 +248,23 @@ class HierarchicalMemoryBank(Module):
 
         # From archive (decompress via VAE decoder)
         archive = self.archive
+        corrupted_tags = []
         for tag, entry in archive.items():
-            h_z = entry["h_z"]                               # (compress_dim,)
-            z_t = Tensor(h_z[None, :], requires_grad=False)  # (1, compress_dim)
-            h_dec = self.vae.decode(z_t).data[0]              # (D,)
-            if h_dec.shape[0] == D:
-                cands_h.append(h_dec)
-                cands_u.append(entry["uncertainty"])
-                # Increment access count
-                entry["access_count"] += 1
+            try:
+                h_z = entry["h_z"]                               # (compress_dim,)
+                z_t = Tensor(h_z[None, :], requires_grad=False)  # (1, compress_dim)
+                h_dec = self.vae.decode(z_t).data[0]              # (D,)
+                if not np.all(np.isfinite(h_dec)):
+                    corrupted_tags.append(tag)
+                    continue
+                if h_dec.shape[0] == D:
+                    cands_h.append(h_dec)
+                    cands_u.append(entry["uncertainty"])
+                    entry["access_count"] += 1
+            except Exception:
+                corrupted_tags.append(tag)
+        for tag in corrupted_tags:
+            archive.pop(tag, None)
 
         if len(cands_h) == 0:
             # No memories yet: return zeros

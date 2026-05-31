@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import numpy as np
 import warnings
-from typing import List, Optional, Callable
+from typing import Callable
 
 from engine.tensor import Tensor, Parameter, zeros, ones, randn
 from engine.module import Module

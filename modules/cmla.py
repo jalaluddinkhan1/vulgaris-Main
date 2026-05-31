@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import numpy as np
-from typing import List, Tuple
 
 from engine.tensor import Tensor, Parameter, zeros
 from engine.module import Module
@@ -42,7 +43,7 @@ class CrossModalLatentAlignment(Module):
     Maintains a running alignment matrix Omega[i,j] = cosine_sim(E_i, E_j).
     """
 
-    def __init__(self, modality_dims: List[int], d_model: int,
+    def __init__(self, modality_dims: list[int], d_model: int,
                  temperature: float = 0.07):
         super().__init__()
         self.n_modalities = len(modality_dims)
@@ -73,7 +74,7 @@ class CrossModalLatentAlignment(Module):
         return self._get_encoder(modality_idx)(x)
 
     # ------------------------------------------------------------------
-    def _update_alignment(self, embeddings: List[Tensor]):
+    def _update_alignment(self, embeddings: list[Tensor]):
         """Update running cosine-similarity alignment matrix (numpy side)."""
         M = self.n_modalities
         # Compute mean embedding per modality over batch*T
@@ -94,7 +95,7 @@ class CrossModalLatentAlignment(Module):
         self._align_count += 1
 
     # ------------------------------------------------------------------
-    def fuse(self, embeddings: List[Tensor]) -> Tuple[Tensor, List[Tensor]]:
+    def fuse(self, embeddings: list[Tensor]) -> tuple[Tensor, list[Tensor]]:
         """
         Inverse-variance weighted fusion of modality embeddings.
 
@@ -164,7 +165,7 @@ class CrossModalLatentAlignment(Module):
         return fused, unc_tensors
 
     # ------------------------------------------------------------------
-    def contrastive_loss(self, embeddings: List[Tensor]) -> Tensor:
+    def contrastive_loss(self, embeddings: list[Tensor]) -> Tensor:
         """
         InfoNCE loss across modalities.
 
@@ -308,7 +309,7 @@ class CrossModalLatentAlignment(Module):
         return loss_t
 
     # ------------------------------------------------------------------
-    def forward(self, inputs: List[Tensor]) -> Tuple[Tensor, Tensor, List[Tensor]]:
+    def forward(self, inputs: list[Tensor]) -> tuple[Tensor, Tensor, list[Tensor]]:
         """
         inputs[m]: (batch, T, d_m)  for modality m
 

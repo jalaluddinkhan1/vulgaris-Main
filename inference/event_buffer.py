@@ -25,9 +25,10 @@ Usage
     batch = buf.get_batch()         # returns (N, 2) array or None
     if batch is not None:
         model.infer(batch)
+from __future__ import annotations
+
 """
 
-from __future__ import annotations
 
 import time
 import ctypes

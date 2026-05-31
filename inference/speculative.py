@@ -40,9 +40,10 @@ Usage
     sr = SpeculativeRollout(model, gamma=4, accept_threshold=0.05)
     outputs = sr.rollout(x_context, horizon=20, domain_idx=0)
     print(sr.stats())   # acceptance rate, effective speedup
+from __future__ import annotations
+
 """
 
-from __future__ import annotations
 
 import numpy as np
 from typing import List, Optional, Tuple

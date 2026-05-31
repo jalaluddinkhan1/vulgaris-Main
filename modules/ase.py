@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import numpy as np
-from typing import Optional
 
 from engine.tensor import Tensor, Parameter, zeros
 from engine.module import Module
@@ -27,19 +28,19 @@ class AdaptiveSignalEmbedding(Module):
         # Learnable wavelet parameters per filter: shape (n_filters,)
         # Amplitude: log_A -> A = exp(log_A)
         self.log_A = Parameter(
-            np.zeros(n_filters, dtype=np.float64), name="log_A"
+            np.zeros(n_filters, dtype=np.float32), name="log_A"
         )
         # Width: log_sigma -> sigma = exp(log_sigma)
         self.log_sigma = Parameter(
-            np.zeros(n_filters, dtype=np.float64), name="log_sigma"
+            np.zeros(n_filters, dtype=np.float32), name="log_sigma"
         )
         # Frequency
         self.omega = Parameter(
-            np.linspace(1.0, 8.0, n_filters, dtype=np.float64), name="omega"
+            np.linspace(1.0, 8.0, n_filters, dtype=np.float32), name="omega"
         )
         # Phase
         self.phi = Parameter(
-            np.zeros(n_filters, dtype=np.float64), name="phi"
+            np.zeros(n_filters, dtype=np.float32), name="phi"
         )
 
         # Total channels after multi-scale concatenation: n_scales * n_filters
@@ -59,7 +60,7 @@ class AdaptiveSignalEmbedding(Module):
         # we materialise the wavelet for a single in_channel and use it for all.
         # We store a per-filter, per-input-channel scale parameter for mixing.
         self.channel_mix = Parameter(
-            np.random.randn(n_filters, in_channels + 1).astype(np.float64) * 0.02,
+            np.random.randn(n_filters, in_channels + 1).astype(np.float32) * 0.02,
             name="channel_mix"
         )
 
@@ -75,7 +76,7 @@ class AdaptiveSignalEmbedding(Module):
         psi_k(t) = A_k * exp(-0.5 * (t / sigma_k)^2) * cos(omega_k * t + phi_k)
         """
         fl = self.filter_len
-        t = np.linspace(-fl // 2, fl // 2, fl, dtype=np.float64) / fl  # (fl,)
+        t = np.linspace(-fl // 2, fl // 2, fl, dtype=np.float32) / fl  # (fl,)
 
         A = np.exp(self.log_A.data)        # (n_filters,)
         sigma = np.exp(self.log_sigma.data) # (n_filters,)
@@ -114,7 +115,7 @@ class AdaptiveSignalEmbedding(Module):
         else:
             # Effective kernel length after zero-insertion
             K_eff = (K - 1) * dilation + 1
-            dilated_k = np.zeros((C_out, C_in, K_eff), dtype=np.float64)
+            dilated_k = np.zeros((C_out, C_in, K_eff), dtype=np.float32)
             dilated_k[:, :, ::dilation] = kernel_np
 
         K_eff = dilated_k.shape[2]
@@ -127,7 +128,7 @@ class AdaptiveSignalEmbedding(Module):
             x_pad = x_np
 
         T_out = x_pad.shape[2] - K_eff + 1
-        out = np.zeros((B, C_out, T_out), dtype=np.float64)
+        out = np.zeros((B, C_out, T_out), dtype=np.float32)
 
         for k in range(K_eff):
             if dilated_k[0, 0, k] == 0.0 and dilation > 1:
@@ -146,8 +147,8 @@ class AdaptiveSignalEmbedding(Module):
     def forward(
         self,
         x: Tensor,
-        timestamps: Optional[Tensor] = None,
-        mask: Optional[np.ndarray] = None,
+        timestamps: Tensor | None = None,
+        mask: np.ndarray | None = None,
     ) -> Tensor:
         """
         x          : (batch, in_channels, T)
@@ -192,16 +193,37 @@ class AdaptiveSignalEmbedding(Module):
         # x_mixed now has n_filters channels, ready for per-filter single-channel conv
 
         fl = self.filter_len
-        scale_outputs = []
-        kernels_2d = kernels_1ch[:, 0, :]  # (n_filters, fl) — squeeze 1-channel dim
+        kernels_2d = kernels_1ch[:, 0, :]  # (n_filters, fl)
 
         from engine.fft_conv import fft_conv1d
 
+        # Channel-independent extraction: apply the wavelet bank to each input
+        # channel separately so the model never conflates channel identities before
+        # causal discovery (CRG) has had a chance to learn which channels relate.
+        # Result: (B, actual_in, n_scales * n_filters, T) → reduce over channels last.
+        scale_outputs_per_channel = []   # list over channels; each: list of (B, n_filters, T)
+
+        for c in range(actual_in):
+            x_c = x_np[:, c:c+1, :]          # (B, 1, T) — single channel
+            # channel_mix[k, c] scales how much filter k uses channel c
+            cm_c = cm[:, c]                   # (n_filters,) scaling per filter
+            # Expand x_c to (B, n_filters, T) by scaling each filter independently
+            x_c_expanded = np.broadcast_to(x_c, (x_c.shape[0], self.n_filters, x_c.shape[2])).copy()
+            x_c_expanded = x_c_expanded * cm_c[None, :, None]   # (B, n_filters, T)
+
+            ch_scales = []
+            for s in range(self.n_scales):
+                dilation = 2 ** s
+                out_s = fft_conv1d(x_c_expanded, kernels_2d, dilation=dilation)  # (B, n_filters, T)
+                ch_scales.append(out_s)
+            scale_outputs_per_channel.append(ch_scales)
+
+        # Aggregate over channels: sum contributions (equivalent to the old channel_mix einsum
+        # but computed AFTER the per-channel frequency extraction, not before)
+        scale_outputs = []
         for s in range(self.n_scales):
-            dilation = 2 ** s
-            # FFT conv: O(T log T) vs O(T*K) direct; 'same' length maintained internally
-            out_s = fft_conv1d(x_mixed, kernels_2d, dilation=dilation)  # (B, n_filters, T)
-            scale_outputs.append(out_s)
+            out_s = sum(scale_outputs_per_channel[c][s] for c in range(actual_in))
+            scale_outputs.append(out_s)   # (B, n_filters, T)
 
         # Concatenate scales: (B, n_scales * n_filters, T)
         multi_scale = np.concatenate(scale_outputs, axis=1)  # (B, total_ch, T)

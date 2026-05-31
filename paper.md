@@ -2026,6 +2026,101 @@ with $\hat{\sigma}_c^2 = v_c / (n-1)$. This allows normalization to track a slow
 
 ---
 
+### 24.7 Regime Mixture Core (`modules/rmc.py`)
+
+Industrial processes seldom occupy a single operating regime: a chemical reactor transitions between startup, steady-state, and shutdown phases; a 5G cell oscillates between high-traffic peak hours and low-load off-peak periods. Conditioning a monolithic model on all regimes simultaneously forces the shared parameter space to represent mutually contradictory dynamics, increasing the risk of interference and impeding specialisation. We address this with the **Regime Mixture Core (RMC)**, a Switch-Transformer-style soft Mixture-of-Experts layer (Fedus et al., 2021) that routes each token to a learned weighted combination of $K$ expert sub-networks.
+
+Given input $\mathbf{x} \in \mathbb{R}^{B \times T \times d}$, a gate linear layer $W_g \in \mathbb{R}^{K \times d}$ produces per-token routing logits, scaled by temperature $\tau$ and normalised:
+$$g_{b,t,k} = \frac{\exp((\mathbf{x}_{b,t} \cdot \mathbf{w}_{g,k}) / \tau)}{\sum_{k'} \exp((\mathbf{x}_{b,t} \cdot \mathbf{w}_{g,k'}) / \tau)}$$
+
+Each of the $K$ experts is a linear map $e_k : \mathbb{R}^d \to \mathbb{R}^d$. The output is the gating-weighted sum:
+$$\text{RMC}(\mathbf{x})_{b,t} = \sum_{k=1}^K g_{b,t,k} \cdot e_k(\mathbf{x}_{b,t})$$
+
+To prevent expert collapse — the degenerate outcome where all tokens route to a single expert — an auxiliary load-balancing loss (Fedus et al., 2021) is added to the training objective:
+$$\mathcal{L}_{\text{balance}} = \lambda_{\text{bal}} \cdot K \sum_{k=1}^{K} f_k \cdot P_k$$
+where $f_k = \frac{1}{BT}\sum_{b,t}\mathbb{1}[\arg\max_k g_{b,t,k} = k]$ is the hard-routed fraction (computed without gradients) and $P_k = \frac{1}{BT}\sum_{b,t}g_{b,t,k}$ is the mean differentiable routing probability. The product $f_k P_k$ is minimised when routing is uniform across experts. The RMC also exposes a `regime_assignments()` method returning $(B, T)$ hard assignment indices, enabling post-hoc regime-based metric stratification without retraining.
+
+---
+
+### 24.8 Knowledge Distillation (`training/distillation.py`)
+
+Deploying a full-capacity VULGARIS model at the network edge may exceed the memory or latency budget of the target hardware. **Knowledge distillation** (Hinton et al., 2015) transfers the generalisation behaviour of a large teacher model into a compact student model by training the student to match the teacher's soft output distribution rather than only the hard ground-truth labels.
+
+For a batch of inputs, the teacher and student each produce logit vectors $\mathbf{z}_T$ and $\mathbf{z}_S$. Soft probabilities at temperature $T$ are:
+$$p^{(T)}_c = \frac{\exp(z_{T,c}/T)}{\sum_{c'}\exp(z_{T,c'}/T)}, \quad p^{(S)}_c = \frac{\exp(z_{S,c}/T)}{\sum_{c'}\exp(z_{S,c'}/T)}$$
+
+The soft-target loss is the KL divergence scaled by $T^2$, which restores the gradient magnitude suppressed by the temperature division:
+$$\mathcal{L}_{\text{soft}} = T^2 \cdot D_{\text{KL}}\!\left(p^{(T)} \,\|\, p^{(S)}\right)$$
+
+Intermediate layer hints align internal representations via MSE:
+$$\mathcal{L}_{\text{hint}} = \frac{1}{BT}\left\|\mathbf{h}_S W_h - \mathbf{h}_T\right\|_F^2$$
+where $W_h \in \mathbb{R}^{d_S \times d_T}$ is a learned projector created automatically when student and teacher hidden dimensions differ. The combined loss is:
+$$\mathcal{L} = \alpha \mathcal{L}_{\text{hard}} + (1-\alpha)\!\left(T^2 \mathcal{L}_{\text{soft}} + \beta \mathcal{L}_{\text{hint}}\right)$$
+
+The `DistillationTrainer` freezes all teacher parameters on construction, ensuring teacher gradients are never allocated. Default hyperparameters ($T=4$, $\alpha=0.5$, $\beta=0.1$) are drawn from the original Hinton et al. (2015) study and are exposed as configurable arguments.
+
+---
+
+### 24.9 Active Learning (`training/active_learning.py`)
+
+Labelled sensor data in industrial settings is expensive to obtain: anomaly labels require manual expert annotation; failure-mode labels may require deliberately inducing faults. **Pool-based active learning** (Settles, 2009) reduces the labelling cost by selecting the subset of unlabelled samples from a candidate pool that maximises the model's information gain, rather than labelling uniformly at random.
+
+VULGARIS implements an `ActiveLearner` supporting four acquisition functions. Let $\mathbf{p} \in \mathbb{R}^{B \times C}$ denote softmax class probabilities on the pool:
+
+- **Uncertainty** (output variance): $a_i = \mathrm{Var}_c(p_{i,c})$ — highest for flat distributions.
+- **Entropy** (Shannon): $a_i = -\sum_c p_{i,c} \log(p_{i,c}+\varepsilon)$ — maximised at the uniform distribution.
+- **Margin** (top-2 gap): $a_i = -(p_{i,(1)} - p_{i,(2)})$ — smallest when the two leading classes are near-tied.
+- **Random**: $a_i \sim \mathcal{U}(0,1)$ — baseline for ablation.
+
+Monte Carlo dropout (Gal and Ghahramani, 2016) is supported via the `n_mc` parameter: the model is queried $n_{\text{mc}}$ times with dropout active, and per-sample variance across runs is used as the uncertainty acquisition score, providing a Bayesian approximation to predictive uncertainty without weight-space integration. A labeled-set exclusion mask prevents re-querying already-annotated indices. The `query(pool, k)` method returns the top-$k$ indices by acquisition score, ready for Oracle labelling.
+
+---
+
+### 24.10 Speculative Autoregressive Rollout (`inference/speculative.py`)
+
+Streaming inference in VULGARIS operates step-by-step, with each full forward pass consuming a new sensor observation. The full model's cost per step scales with the parameter count; at high sensor rates this may saturate available compute. **Speculative decoding** (Leviathan et al., 2023; Chen et al., 2023) amortises this cost by using a lightweight draft model to propose $\gamma$ future steps and verifying them with a single full-model evaluation.
+
+VULGARIS implements this as `SpeculativeRollout`. A `WorldModelHead` — a shallow MLP operating in latent space — autoregressively drafts $\gamma$ future latent states from the current hidden state $\mathbf{z}_t$:
+$$\hat{\mathbf{z}}_{t+i} = \text{WorldModelHead}(\hat{\mathbf{z}}_{t+i-1}), \quad i = 1, \ldots, \gamma$$
+
+The full model is then advanced $\gamma$ steps from the same initial state to produce a verified latent $\mathbf{z}_{t+\gamma}^{\text{verify}}$. The two terminal predictions are compared under the infinity norm:
+$$\delta = \left\|\hat{\mathbf{y}}_{t+\gamma} - \mathbf{y}_{t+\gamma}^{\text{verify}}\right\|_\infty$$
+
+If $\delta < \theta_{\text{accept}}$, the draft is accepted and the model state is advanced to $\hat{\mathbf{z}}_{t+\gamma}$, saving $\gamma - 1$ full-model evaluations. On rejection, the verified state $\mathbf{z}_{t+\gamma}^{\text{verify}}$ is retained — the verification pass is never wasted. The `acceptance_rate` and `effective_speedup` statistics are tracked at runtime. The infinity-norm criterion bounds worst-case per-dimension output error without requiring calibrated per-output thresholds.
+
+---
+
+### 24.11 In-Context Learning (`modules/icl.py`)
+
+Domain adaptation via full fine-tuning is impractical for edge deployments with restricted memory write bandwidth. **In-context learning (ICL)** enables zero-shot adaptation at inference time without any weight updates: a small set of reference examples is condensed into a context vector and injected into the main forward pass via cross-attention.
+
+The `ContextEncoder` independently encodes each of $N$ reference (input, label) pairs and mean-pools the resulting representations:
+$$\mathbf{c} = \frac{1}{N}\sum_{i=1}^N \text{MLP}([\mathbf{x}^{(i)} \,\|\, \mathbf{y}^{(i)}]) \in \mathbb{R}^{d_{\text{ctx}}}$$
+
+Mean-pooling is permutation-invariant, making the adaptation robust to context ordering. The `InContextAdapter` injects $\mathbf{c}$ into the main stream $\mathbf{h} \in \mathbb{R}^{B \times T \times d}$ via single-head cross-attention:
+$$\text{Attn}(\mathbf{h}, \mathbf{c}) = \text{softmax}\!\left(\frac{(\mathbf{h}W_Q)(\mathbf{c}W_K)^\top}{\sqrt{d_{\text{head}}}}\right)(\mathbf{c}W_V)$$
+
+The cross-attended context is mixed into the residual stream through a gated connection:
+$$\mathbf{h}' = \mathbf{h} + \sigma(g_{\text{raw}}) \cdot \text{Attn}(\mathbf{h}, \mathbf{c})$$
+
+The gate scalar $g_{\text{raw}}$ is initialised to a small negative value so $\sigma(g_{\text{raw}}) \approx 0$, ensuring the adapter starts as a near-identity map and does not disturb pretrained representations (Hu et al., 2022). As training progresses the gate opens, allowing context information to increasingly influence the forward pass. The `ICLConfig.max_context` parameter bounds $N$ at inference time, keeping cross-attention cost $O(N)$ per token.
+
+---
+
+### 24.12 Neuro-Symbolic Rule Engine and Ontology Embedding (`modules/rule_engine.py`, `modules/ontology_embedding.py`)
+
+Industrial AI systems must satisfy regulatory auditability requirements (IEC 61508, NERC CIP) that are incompatible with purely black-box neural inference. VULGARIS addresses this through two complementary neuro-symbolic components: the **RuleEngine** and the **OntologyEmbedding**.
+
+**RuleEngine.** Rules are represented as `Rule` dataclasses with a condition predicate, a consequence action, and a scalar confidence. The `RuleRegistry` maintains a versioned collection of active rules. The `RuleEncoder` embeds the registry into the neural computation: each rule's token sequence is masked mean-pooled into a fixed-length vector, then linearly projected into the model's meta-dimension, producing a rule-conditioned context that influences the DAH hypernetwork's adapter generation. A soft constraint loss enforces rule compliance:
+$$\mathcal{L}_{\text{rule}} = \frac{1}{R}\sum_{r=1}^R (1 - \sigma(s_r)) \cdot \text{violation}_r$$
+where $s_r$ is the gate activation for rule $r$ and $\text{violation}_r$ is the degree to which the model output violates rule $r$'s condition. The `RuleLifecycleManager` implements decay, pruning, and merging: rules whose confidence falls below a threshold are pruned; rules whose conditions overlap above a similarity threshold are merged into a single more general rule. The `RuleDistiller` provides bidirectional translation between the neural representation and the symbolic registry, allowing rules to be exported as human-readable strings for regulatory inspection.
+
+**OntologyEmbedding.** An 80-term industrial vocabulary organised into 12 semantic clusters (thermal, vibration, electrical, control, network, safety, and six additional domain groups) is embedded via a learned cluster embedding matrix $E \in \mathbb{R}^{12 \times d_{\text{ont}}}$. Terms within a cluster share an embedding; the domain embedding for a given deployment is the mean of the cluster embeddings for all active terms:
+$$\mathbf{e}_{\text{domain}} = \frac{1}{|S|}\sum_{t \in S} E[\text{cluster}(t)]$$
+This vector is concatenated to the DAH domain conditioning signal (Section 5), injecting structured semantic priors that are grounded in established industrial ontologies (IEC CDD, ISA-95) rather than inferred purely from data. The `OntologyRegistry` stores per-domain embeddings with $O(1)$ lookup, enabling zero-shot transfer to new industrial domains that share cluster semantics with the training distribution.
+
+---
+
 ## References
 
 Ames, A. D., Xu, X., Grizzle, J. W., and Tabuada, P. (2016). Control barrier function based quadratic programs for safety critical systems. *IEEE Transactions on Automatic Control*, 62(8), 3861â€“3876.

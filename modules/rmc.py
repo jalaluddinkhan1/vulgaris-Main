@@ -28,12 +28,12 @@ Usage
     rmc = RegimeMixtureCore(d_model=256, n_experts=4)
     z_out, balance_loss = rmc(z)   # z: (B, T, d_model)
     # wire as:  z = z + z_out  in Vulgaris.forward()
-"""
-
 from __future__ import annotations
 
+"""
+
+
 import numpy as np
-from typing import Tuple
 
 from engine.tensor import Tensor, Parameter
 from engine.module import Module
@@ -51,18 +51,23 @@ class RegimeMixtureCore(Module):
     tau       : gating temperature — lower values → harder routing (default 1.0)
     """
 
-    def __init__(self, d_model: int, n_experts: int = 4, tau: float = 1.0):
+    def __init__(self, d_model: int, n_experts: int = 4, tau: float = 1.0,
+                 top_k: int = 0):
+        """
+        top_k : number of experts activated per token (0 = all experts, soft routing).
+                top_k=2 gives Switch-Transformer-style sparse routing with straight-through
+                gradient so inactive experts still receive gradients.
+        """
         super().__init__()
         self.d_model   = d_model
         self.n_experts = n_experts
         self.tau       = tau
+        self.top_k     = top_k if 0 < top_k <= n_experts else n_experts
 
         # Gating network: d_model → K logits
         self.gate_proj = Linear(d_model, n_experts)
+        self.last_regime_weights: np.ndarray | None = None
 
-        # K expert networks, each d_model → d_model
-        # Stored as list; Module.__setattr__ registers dicts/lists only if
-        # they are Modules, so we register each expert explicitly.
         for k in range(n_experts):
             setattr(self, f"expert_{k}", Linear(d_model, d_model))
 
@@ -71,12 +76,14 @@ class RegimeMixtureCore(Module):
 
     # ──────────────────────────────────────────────────────────────────────
 
-    def forward(self, z: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, z: Tensor) -> tuple[Tensor, Tensor]:
         """
         z : (B, T, d_model)
         Returns:
-            z_out         : (B, T, d_model)  — weighted expert mixture
-            balance_loss  : scalar Tensor    — Switch-Transformer load-balancing
+            z_out          : (B, T, d_model)  — weighted expert mixture
+            balance_loss   : scalar Tensor    — Switch-Transformer load-balancing
+            regime weights are stored on self.last_regime_weights for callers
+            that need them, such as CRG regime-conditioned routing.
         """
         B, T, D = z.data.shape
         K = self.n_experts
@@ -94,6 +101,19 @@ class RegimeMixtureCore(Module):
         denom = exp_s.sum(axis=-1, keepdims=True) + 1e-8
         weights_np = exp_s / denom   # (N, K) — soft routing probabilities
 
+        # Straight-through sparse top-k: keep full softmax weights for gradient
+        # computation (so inactive experts still train), but zero out non-top-k
+        # contributions to the forward output.
+        weights_np_full = weights_np.copy()   # (N, K) — pre-mask, used in backward
+
+        if self.top_k < K:
+            topk_idx = np.argsort(weights_np, axis=-1)[:, -self.top_k:]  # (N, top_k)
+            mask = np.zeros_like(weights_np)
+            np.put_along_axis(mask, topk_idx, 1.0, axis=-1)
+            weights_np = weights_np * mask
+            denom_topk = weights_np.sum(axis=-1, keepdims=True) + 1e-8
+            weights_np = weights_np / denom_topk   # re-normalise sparse weights
+
         weights = Tensor(
             weights_np,
             requires_grad=scores_flat.requires_grad,
@@ -102,19 +122,21 @@ class RegimeMixtureCore(Module):
         )
         _sf = scores_flat
         _tau = self.tau
+        _w_full = weights_np_full   # straight-through: grad uses full softmax weights
 
         def _softmax_back():
             if _sf.requires_grad and weights.grad is not None:
-                g = weights.grad                                    # (N, K)
-                sg = (g * weights_np).sum(axis=-1, keepdims=True)  # (N, 1)
-                d_scores = weights_np * (g - sg) / _tau
+                g = weights.grad                                       # (N, K)
+                # Straight-through: propagate gradient as if no top-k mask was applied
+                sg = (g * _w_full).sum(axis=-1, keepdims=True)        # (N, 1)
+                d_scores = _w_full * (g - sg) / _tau
                 _sf.grad = _sf.grad + d_scores if _sf.grad is not None else d_scores
 
         weights._backward = _softmax_back
 
         # ── Expert outputs ─────────────────────────────────────────────────
         # Each expert produces (N, D); sum weighted contributions
-        z_out_np = np.zeros((B * T, D), dtype=np.float64)
+        z_out_np = np.zeros((B * T, D), dtype=np.float32)
         expert_outputs = []
         for k, expert in enumerate(self._experts()):
             e_k = expert(z_flat)           # (N, D)
@@ -141,7 +163,7 @@ class RegimeMixtureCore(Module):
             g_out = z_out_flat.grad   # (N, D)
             # Gradient to each expert_k output: g_e_k = weights_k * g_out
             # Gradient to weights_k: g_w_k = sum_d(g_out * e_k_data)
-            g_weights_np = np.zeros((_weights.data.shape[0], _K), dtype=np.float64)
+            g_weights_np = np.zeros((_weights.data.shape[0], _K), dtype=np.float32)
             for k, (e_k_t, w_k_np) in enumerate(_expert_outputs_list):
                 g_ek = w_k_np[:, None] * g_out       # (N, D)
                 if e_k_t.requires_grad:
@@ -161,7 +183,7 @@ class RegimeMixtureCore(Module):
         # f_k: hard assignment fraction (straight-through, no gradient)
         hard_assign = np.argmax(weights_np, axis=-1)   # (N,) ∈ {0,...,K-1}
         f_k = np.array([np.mean(hard_assign == k) for k in range(K)],
-                       dtype=np.float64)               # (K,)
+                       dtype=np.float32)               # (K,)
 
         # P_k: mean soft weight per expert (differentiable)
         P_k_np = weights_np.mean(axis=0)               # (K,)
@@ -186,7 +208,7 @@ class RegimeMixtureCore(Module):
 
         # balance_loss = K * sum_k(f_k * P_k)
         # f_k is a constant (no gradient); only P_k carries gradient
-        balance_np = np.array([[K * float(np.dot(f_k, P_k_np))]], dtype=np.float64)
+        balance_np = np.array([[K * float(np.dot(f_k, P_k_np))]], dtype=np.float32)
         balance_loss = Tensor(
             balance_np,
             requires_grad=P_k.requires_grad,
@@ -205,6 +227,10 @@ class RegimeMixtureCore(Module):
 
         balance_loss._backward = _balance_back
 
+        # Return mean per-regime routing weight so callers (e.g. CRG) never
+        # need to re-run gate_proj to extract regime context.
+        regime_weights = weights_np_full.mean(axis=0).astype(np.float32)   # (K,)
+        self.last_regime_weights = regime_weights
         return z_out, balance_loss
 
     def regime_assignments(self, z: Tensor) -> np.ndarray:

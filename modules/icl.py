@@ -25,10 +25,11 @@ How it works
    - Output : context-conditioned residual      (B, T, d_model)
 
 3. The residual is added back to z before CRG/HMB/output.
+from __future__ import annotations
+
 """
 
 import numpy as np
-from typing import List, Tuple, Optional
 
 from engine.tensor import Tensor, Parameter
 from engine.module import Module
@@ -49,8 +50,10 @@ class ContextEncoder(Module):
         super().__init__()
         self.d_model = d_model
         self.output_dim = output_dim
-        self.y_proj = Linear(output_dim, d_model, bias=True)
-        self.norm   = RMSNorm(d_model)
+        self.y_proj   = Linear(output_dim, d_model, bias=True)
+        # Learned query for attention pooling — replaces mean-pool
+        self.pool_q   = Linear(d_model, 1, bias=False)
+        self.norm     = RMSNorm(d_model)
 
     def forward(self, z_ref: Tensor, y_ref: Tensor) -> Tensor:
         """
@@ -58,24 +61,41 @@ class ContextEncoder(Module):
         y_ref : (B, output_dim)
         Returns (B, d_model).
         """
-        B, T_ref, D = z_ref.data.shape
+        B, _, D = z_ref.data.shape
 
-        # Mean-pool over time with gradient linkage
-        pool_np = z_ref.data.mean(axis=1)   # (B, D)
+        # Attention pooling: learned scalar score per timestep via pool_q,
+        # then softmax-weighted sum. Outperforms mean-pool by letting the
+        # encoder focus on the most informative timesteps.
+        scores_3d = self.pool_q(z_ref)                        # (B, T_ref, 1)
+        scores = scores_3d.data[:, :, 0] / np.sqrt(D)         # (B, T_ref)
+        scores_shifted = scores - scores.max(axis=1, keepdims=True)
+        exp_s = np.exp(scores_shifted)
+        weights = exp_s / exp_s.sum(axis=1, keepdims=True)    # (B, T_ref)
+
+        pool_np = np.einsum("bt,btd->bd", weights, z_ref.data).astype(np.float32)
         pool_t = Tensor(
-            pool_np.astype(np.float32),
-            requires_grad=z_ref.requires_grad,
-            _children=(z_ref,),
-            _op="ctx_pool"
+            pool_np,
+            requires_grad=z_ref.requires_grad or scores_3d.requires_grad,
+            _children=(z_ref, scores_3d),
+            _op="attn_pool"
         )
-        _z = z_ref
-        _T = T_ref
+        _z, _s3, _w = z_ref, scores_3d, weights
 
         def _pool_back():
-            if _z.requires_grad and pool_t.grad is not None:
-                contrib = np.zeros_like(_z.data)
-                contrib += pool_t.grad[:, None, :] / _T
-                _z.grad = _z.grad + contrib if _z.grad is not None else contrib
+            if pool_t.grad is None:
+                return
+            g = pool_t.grad  # (B, D)
+            # Gradient through direct weighted-sum path: d(pool)/d(z_t) += w_t
+            if _z.requires_grad:
+                g_direct = _w[:, :, None] * g[:, None, :]     # (B, T_ref, D)
+                _z.grad = _z.grad + g_direct if _z.grad is not None else g_direct
+            # Gradient through scores (for pool_q weights):
+            # dL/ds_t = w_t * (g · z_t − g · pool)
+            if _s3.requires_grad:
+                gz_t  = np.einsum("bd,btd->bt", g, _z.data)   # (B, T_ref)
+                g_pool = np.einsum("bd,bd->b", g, pool_np)[:, None]  # (B, 1)
+                g_s = (_w * (gz_t - g_pool) / np.sqrt(D))[:, :, None].astype(np.float32)
+                _s3.grad = _s3.grad + g_s if _s3.grad is not None else g_s
 
         pool_t._backward = _pool_back
 
@@ -155,33 +175,67 @@ class InContextLearning(Module):
 
     Parameters
     ----------
-    d_model    : model dimension
-    output_dim : dimensionality of y labels in context pairs
-    n_heads    : cross-attention heads
+    d_model         : model dimension
+    output_dim      : dimensionality of y labels in context pairs
+    n_heads         : cross-attention heads
+    episodic_memory : optional EpisodicMemory — when provided, successful context
+                      encodings are stored and retrieved automatically at inference
+                      time, giving ICL persistent memory across sessions.
     """
 
-    def __init__(self, d_model: int, output_dim: int, n_heads: int = 4):
+    def __init__(self, d_model: int, output_dim: int, n_heads: int = 4,
+                 episodic_memory=None):
         super().__init__()
-        self.encoder = ContextEncoder(d_model=d_model, output_dim=output_dim)
-        self.adapter = InContextAdapter(d_model=d_model, n_heads=n_heads)
-        self.d_model = d_model
-        self.output_dim = output_dim
+        self.encoder        = ContextEncoder(d_model=d_model, output_dim=output_dim)
+        self.adapter        = InContextAdapter(d_model=d_model, n_heads=n_heads)
+        self.d_model        = d_model
+        self.output_dim     = output_dim
+        # EpisodicMemory instance (not a Module — no parameters, pure numpy state)
+        self.episodic_memory = episodic_memory
 
     def encode_context(
         self,
-        context_latents: List[Tensor],   # each (B, T_ref, d_model) — pre-encoded
-        context_labels:  List[Tensor],   # each (B, output_dim)
+        context_latents: list[Tensor],   # each (B, T_ref, d_model) — pre-encoded
+        context_labels:  list[Tensor],   # each (B, output_dim)
+        retrieve_k: int = 0,             # if > 0, augment with top-k episodes from memory
     ) -> Tensor:
         """
         Encodes each (z_ref, y_ref) pair and stacks into (B, n_ctx, d_model).
+
+        When `episodic_memory` is attached and `retrieve_k > 0`, the method:
+          1. Retrieves top-k similar past episodes from memory using the first
+             provided context as the query.
+          2. Prepends those retrieved vectors to the current context set so
+             the cross-attention sees both retrieved history and the current context.
+          3. Stores each newly encoded context vector in episodic memory for
+             future retrieval.
         """
         ctx_vecs = []
         for z_ref, y_ref in zip(context_latents, context_labels):
             vec = self.encoder(z_ref, y_ref)   # (B, d_model)
             ctx_vecs.append(vec)
 
+            # Store into episodic memory (batch item 0 as the representative key)
+            if self.episodic_memory is not None:
+                key_np   = vec.data[0]                         # (d_model,) float32
+                label_np = self.encoder.y_proj(y_ref).data[0]  # (d_model,) projected label
+                self.episodic_memory.store(key_np, label_np)
+
         if not ctx_vecs:
             raise ValueError("context must contain at least one example")
+
+        # Episodic retrieval: prepend retrieved past contexts to the current set
+        if self.episodic_memory is not None and retrieve_k > 0 and len(self.episodic_memory) > 0:
+            query_np = ctx_vecs[0].data[0]   # (d_model,) — use first encoded vec as query
+            ret_keys, ret_vals, _, _ = self.episodic_memory.retrieve(query_np, top_k=retrieve_k)
+            # ret_keys: (k, d_model) — inject as additional context vectors (no grad)
+            import numpy as _np
+            B_ctx = ctx_vecs[0].data.shape[0]
+            for i in range(len(ret_keys)):
+                # Broadcast retrieved key across the batch
+                ret_np = _np.tile(ret_keys[i:i+1], (B_ctx, 1)).astype(_np.float32)
+                ret_t  = Tensor(ret_np, requires_grad=False)
+                ctx_vecs.insert(0, ret_t)   # prepend — most similar first
 
         # Stack: list of (B, d_model) -> (B, n_ctx, d_model)
         n_ctx = len(ctx_vecs)

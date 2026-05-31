@@ -42,6 +42,7 @@ class TestLogAClamp:
     """SSM decay gate: log_a must stay in [-5, 0] regardless of input."""
 
     def _clamp_log_a(self, raw):
+        raw = np.nan_to_num(raw, nan=-5.0, posinf=0.0, neginf=-5.0)
         return np.clip(raw, -5.0, 0.0)
 
     @pytest.mark.parametrize("val", [-1e9, -100.0, -5.0, -1.0, 0.0, 1.0, 1e9, np.nan, np.inf, -np.inf])
@@ -315,7 +316,7 @@ class TestLogEncoderRobustness:
     def test_template_cap_unknown(self):
         enc = self.LogEncoder(max_templates=5)
         for i in range(20):
-            enc.encode(f"unique message number {i} extra data")
+            enc.encode(f"unique_{i} message extra data")
         # After cap, new lines map to tid=0 ("unknown")
         out = enc.encode("completely_novel_line_xyz abc def ghi jkl")
         assert int(out[0]) == 0

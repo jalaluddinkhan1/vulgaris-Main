@@ -117,9 +117,30 @@ class MultiTaskConfig:
 
 
 @dataclass
+class RMCConfig:
+    n_experts: int = 4
+    tau: float = 1.0
+    balance_weight: float = 0.01
+
+
+@dataclass
+class CMLAConfig:
+    n_modalities: int = 4
+    contrastive_temp: float = 0.07
+    contrastive_weight: float = 0.1
+
+
+@dataclass
+class ICLConfig:
+    max_context: int = 16
+    gate_init: float = -4.0
+
+
+@dataclass
 class ModelConfig:
     input_dim: int = 64
     output_dim: int = 64
+    d_model: int = 256
     n_classes: int = 0
     dtype: str = "float32"
     device: str = "cpu"
@@ -134,15 +155,19 @@ class ModelConfig:
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     multitask: MultiTaskConfig = field(default_factory=MultiTaskConfig)
+    rmc: RMCConfig = field(default_factory=RMCConfig)
+    cmla: CMLAConfig = field(default_factory=CMLAConfig)
+    icl: ICLConfig = field(default_factory=ICLConfig)
 
     @classmethod
     def from_env(cls) -> "ModelConfig":
         cfg = cls()
-        cfg.input_dim = int(os.environ.get("VULGARIS_INPUT_DIM", 9))
+        cfg.input_dim  = int(os.environ.get("VULGARIS_INPUT_DIM",  9))
         cfg.output_dim = int(os.environ.get("VULGARIS_OUTPUT_DIM", 1))
-        cfg.n_classes = int(os.environ.get("VULGARIS_N_CLASSES", 5))
-        cfg.ase.latent_dim = int(os.environ.get("VULGARIS_D_MODEL", 64))
-        cfg.ase.n_filters = int(os.environ.get("VULGARIS_N_FILTERS", 16))
+        cfg.n_classes  = int(os.environ.get("VULGARIS_N_CLASSES",  5))
+        cfg.d_model    = int(os.environ.get("VULGARIS_D_MODEL",  256))
+        cfg.rmc.n_experts = int(os.environ.get("VULGARIS_RMC_EXPERTS", 4))
+        cfg.dah.n_domains = int(os.environ.get("VULGARIS_N_DOMAINS",  32))
         return cfg
 
     @classmethod

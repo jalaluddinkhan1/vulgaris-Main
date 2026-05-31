@@ -34,9 +34,10 @@ Standalone (loss only):
     kd_loss = DistillationLoss(temperature=4.0, alpha=0.5)
     loss = kd_loss(student_logits, teacher_logits, y_true,
                    student_latent, teacher_latent)
+from __future__ import annotations
+
 """
 
-from __future__ import annotations
 
 import numpy as np
 from typing import Optional, Tuple

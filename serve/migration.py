@@ -20,9 +20,10 @@ Usage
     # Online: swap running model weights without dropping connections
     adapter = HotSwapAdapter(streaming_inference_instance)
     adapter.swap("checkpoints/model_v2")
+from __future__ import annotations
+
 """
 
-from __future__ import annotations
 
 import hashlib
 import json

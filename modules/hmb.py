@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import numpy as np
 from collections import deque
-from typing import Dict, List, Optional, Tuple
 
 from engine.tensor import Tensor, Parameter
 from engine.module import Module
@@ -25,7 +26,7 @@ class MemoryVAE(Module):
         self.dec1 = Linear(compress_dim, mid)
         self.dec2 = Linear(mid, embed_dim)
 
-    def encode(self, h: Tensor) -> Tuple[Tensor, Tensor]:
+    def encode(self, h: Tensor) -> tuple[Tensor, Tensor]:
         """
         h: (..., embed_dim)
         Returns (mu, logvar) each (..., compress_dim).
@@ -63,7 +64,7 @@ class MemoryVAE(Module):
         x = self.dec1(z).relu()
         return self.dec2(x)
 
-    def vae_loss(self, h: Tensor) -> Tuple[Tensor, Tensor]:
+    def vae_loss(self, h: Tensor) -> tuple[Tensor, Tensor]:
         """
         h: (..., embed_dim)
         Returns (reconstruction_loss, kl_loss) both scalar Tensors.
@@ -150,7 +151,7 @@ class HierarchicalMemoryBank(Module):
 
     # ------------------------------------------------------------------
     def write(self, h: Tensor, timestamp: int,
-              h_predicted: Optional[Tensor] = None):
+              h_predicted: Tensor | None = None):
         """
         h: (batch, T, d_model) Tensor
         Adds averaged representation to working buffer.
@@ -225,7 +226,7 @@ class HierarchicalMemoryBank(Module):
 
     # ------------------------------------------------------------------
     def retrieve(self, h_query: Tensor, top_k: int = 8
-                 ) -> Tuple[Tensor, Tensor]:
+                 ) -> tuple[Tensor, Tensor]:
         """
         h_query: (batch, d_model) Tensor
         Retrieves from working buffer + archive via cosine similarity.
@@ -237,8 +238,8 @@ class HierarchicalMemoryBank(Module):
         q_np = h_query.data                                    # (B, D)
 
         # Collect candidate memory vectors (numpy)
-        cands_h: List[np.ndarray] = []      # each (D,) uncompressed
-        cands_u: List[float] = []
+        cands_h: list[np.ndarray] = []      # each (D,) uncompressed
+        cands_u: list[float] = []
 
         # From working buffer (stored at embed_dim)
         for (h_np, ts, unc) in self.working_buffer:
@@ -368,8 +369,8 @@ class HierarchicalMemoryBank(Module):
             self._archive_entry(h_mean, avg_unc, max_ts, tag)
 
     # ------------------------------------------------------------------
-    def forward(self, h: Tensor, h_predicted: Optional[Tensor] = None,
-                timestamp: Optional[int] = None) -> Tuple[Tensor, Tensor]:
+    def forward(self, h: Tensor, h_predicted: Tensor | None = None,
+                timestamp: int | None = None) -> tuple[Tensor, Tensor]:
         """
         h        : (batch, T, d_model)
         h_predicted: (batch, T, d_model) or None
@@ -443,7 +444,7 @@ class HierarchicalMemoryBank(Module):
         return recon_loss + beta * kl_loss
 
     # ------------------------------------------------------------------
-    def get_stats(self) -> Dict:
+    def get_stats(self) -> dict:
         avg_surp = (self._total_surprise / max(self._surprise_count, 1))
         return {
             "buffer_size": len(self.working_buffer),

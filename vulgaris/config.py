@@ -3,4 +3,5 @@ from config import (  # noqa: F401
     ASEConfig, SSSRConfig, CRGConfig, HMBConfig, SHCALConfig,
     DAHConfig, ESEConfig, HTDConfig, SafetyConfig, TrainingConfig,
     MultiTaskConfig, ModelConfig,
+    RMCConfig, CMLAConfig, ICLConfig,
 )

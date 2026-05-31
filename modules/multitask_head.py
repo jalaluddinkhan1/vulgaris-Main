@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 """Multi-task output head for VULGARIS."""
 import numpy as np
-from typing import Tuple
 
 from engine.tensor import Tensor
 from engine.layers import Linear, RMSNorm
@@ -48,7 +49,7 @@ class MultiTaskHead(Module):
         # Uncertainty head: log-variance output
         self.uncertainty_proj = Linear(d_model, 1)
 
-    def forward(self, z: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward(self, z: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         z: (B, T, d_model)
         Returns: (forecast, anomaly_score, class_probs, uncertainty)

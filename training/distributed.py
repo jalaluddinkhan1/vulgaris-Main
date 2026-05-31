@@ -25,9 +25,10 @@ Environment variables (set by torchrun automatically)
     RANK          : global rank of this process
     WORLD_SIZE    : total number of processes
     LOCAL_RANK    : rank within this node (used for GPU assignment if needed)
+from __future__ import annotations
+
 """
 
-from __future__ import annotations
 
 import datetime
 import os

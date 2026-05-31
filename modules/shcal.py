@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import numpy as np
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import List
 
 from engine.tensor import Tensor, Parameter, zeros, ones, randn
 from engine.module import Module
@@ -58,7 +60,7 @@ class SHCAL(Module):
         After this call, reference_params is snapshotted from current weights.
         """
         # Zero-initialise accumulators
-        accum: Dict[str, np.ndarray] = {}
+        accum: dict[str, np.ndarray] = {}
         for idx, mod in enumerate(self.monitored_modules):
             for attr_name in ("weight", "bias"):
                 param = getattr(mod, attr_name, None)
@@ -103,7 +105,7 @@ class SHCAL(Module):
         object.__setattr__(self, "fisher_diagonal", accum)
 
         # Snapshot reference parameters θ*
-        ref: Dict[str, np.ndarray] = {}
+        ref: dict[str, np.ndarray] = {}
         for idx, mod in enumerate(self.monitored_modules):
             for attr_name in ("weight", "bias"):
                 param = getattr(mod, attr_name, None)
@@ -111,7 +113,7 @@ class SHCAL(Module):
                     ref[f"{idx}.{attr_name}"] = param.data.copy()
         object.__setattr__(self, "reference_params", ref)
 
-    def ewc_loss(self, current_params: Dict[str, Tensor]) -> Tensor:
+    def ewc_loss(self, current_params: dict[str, Tensor]) -> Tensor:
         """EWC penalty: (λ/2) * Σ_i F_i * (θ_i - θ*_i)^2"""
         if not self.fisher_diagonal:
             # Return zero scalar
@@ -136,7 +138,7 @@ class SHCAL(Module):
     # Hebbian update with shadow mode validation
     # ------------------------------------------------------------------
 
-    def hebbian_update(self, activations: Dict[str, Tuple[np.ndarray, np.ndarray]]):
+    def hebbian_update(self, activations: dict[str, tuple[np.ndarray, np.ndarray]]):
         """Apply Δ W = η*(post⊗pre - decay*W) with shadow mode check.
 
         activations: {module_name: (pre, post)}
@@ -270,6 +272,19 @@ class SHCAL(Module):
             self.grow_counter[weight_key] = g_ctr
 
         object.__setattr__(self, "step_counter", self.step_counter + 1)
+
+    def maybe_consolidate(self) -> dict:
+        """
+        Run lightweight consolidation when the online adaptation state asks for it.
+
+        The model calls this after training forwards; keeping the method cheap
+        preserves normal training speed while maintaining the public lifecycle hook.
+        """
+        if self.trigger_adaptation:
+            self.structural_update()
+        else:
+            object.__setattr__(self, "step_counter", self.step_counter + 1)
+        return self.get_adaptation_state()
 
     # ------------------------------------------------------------------
     # State summary

@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import numpy as np
 from collections import deque
-from typing import Optional, Tuple
 
 
 class NonStationaryConformal:
@@ -28,7 +29,7 @@ class NonStationaryConformal:
         # Track coverage: bool per prediction
         self._coverage_history: deque = deque(maxlen=500)
         # Cache the weighted quantile; invalidated when scores change
-        self._quantile_cache: Optional[float] = None
+        self._quantile_cache: float | None = None
         self._quantile_dirty: bool = True
 
     # ──────────────────────────────────────────────────────────────────────
@@ -67,7 +68,7 @@ class NonStationaryConformal:
 
     def predict_interval(
         self, y_pred: np.ndarray, sigma: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Returns (lower, upper) prediction interval arrays.
         lower = y_pred - q̂ * sigma

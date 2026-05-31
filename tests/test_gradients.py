@@ -263,8 +263,8 @@ class TestNumericalGradients(unittest.TestCase):
     def test_masked_reconstruction_mse_grad(self):
         """Masked MSE loss backward vs finite differences on recon output."""
         B, T, C = 2, 6, 3
-        recon_np = np.random.randn(B, T, C).astype(np.float32)
-        target_np = np.random.randn(B, T, C).astype(np.float32)
+        recon_np = np.random.randn(B, T, C).astype(np.float64)
+        target_np = np.random.randn(B, T, C).astype(np.float64)
         mask = np.zeros((B, T), dtype=bool)
         mask[:, :3] = True
         mask_exp = mask[:, :, None].astype(np.float32)
@@ -277,7 +277,7 @@ class TestNumericalGradients(unittest.TestCase):
             diff = recon_t.data - target_np
             loss_s = float((diff**2 * mask_exp).sum()) / denom
             loss = Tensor(
-                np.array([[loss_s]], dtype=np.float32),
+                np.array([[loss_s]], dtype=np.float64),
                 requires_grad=recon_t.requires_grad,
                 _children=(recon_t,), _op="test_mmse"
             )
@@ -286,13 +286,13 @@ class TestNumericalGradients(unittest.TestCase):
             def _b():
                 if _r.requires_grad and loss.grad is not None:
                     g = float(loss.grad.sum())
-                    grad = (2.0 * _d * _me / denom * g).astype(np.float32)
+                    grad = (2.0 * _d * _me / denom * g).astype(np.float64)
                     _r.grad = _r.grad + grad if _r.grad is not None else grad
 
             loss._backward = _b
             return loss
 
-        self._check(_fn, recon_t)
+        self._check(_fn, recon_t, eps=1e-3)
 
 
 # ---------------------------------------------------------------------------

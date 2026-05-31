@@ -20,7 +20,7 @@ Install extras
 
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.7.0"
 __author__  = "VULGARIS Contributors"
 __license__ = "Apache-2.0"
 
@@ -29,10 +29,11 @@ from vulgaris.config import (
     ModelConfig, ASEConfig, SSSRConfig, CRGConfig, HMBConfig,
     SHCALConfig, DAHConfig, ESEConfig, HTDConfig, SafetyConfig,
     TrainingConfig, MultiTaskConfig,
+    RMCConfig, CMLAConfig, ICLConfig,
 )
 
 # ── Core model ────────────────────────────────────────────────────────────────
-from model.vulgaris import Vulgaris, VulgarisState, OutputHead
+from model.vulgaris import Vulgaris, VulgarisState, OutputHead, MultiHorizonHead
 
 # ── Autograd engine ───────────────────────────────────────────────────────────
 from engine.tensor import Tensor, Parameter, zeros, ones, randn, rand, cat, stack
@@ -88,6 +89,10 @@ from training.distributed import (
 )
 from training.distributed_sampler import DistributedSampler
 
+# ── Memory ────────────────────────────────────────────────────────────────────
+from memory.episodic import EpisodicMemory
+from memory.causal   import CausalMemory
+
 # ── Monitoring ────────────────────────────────────────────────────────────────
 from monitoring.drift import DriftDetector
 
@@ -104,9 +109,10 @@ __all__ = [
     "ModelConfig", "ASEConfig", "SSSRConfig", "CRGConfig", "HMBConfig",
     "SHCALConfig", "DAHConfig", "ESEConfig", "HTDConfig", "SafetyConfig",
     "TrainingConfig", "MultiTaskConfig",
+    "RMCConfig", "CMLAConfig", "ICLConfig",
 
     # Core model
-    "Vulgaris", "VulgarisState", "OutputHead",
+    "Vulgaris", "VulgarisState", "OutputHead", "MultiHorizonHead",
 
     # Engine
     "Tensor", "Parameter", "Module", "Linear", "LayerNorm", "RMSNorm",
@@ -141,6 +147,9 @@ __all__ = [
 
     # Preprocessing
     "IndustrialTokenizer", "ChannelSpec", "TokenType", "LogEncoder",
+
+    # Memory
+    "EpisodicMemory", "CausalMemory",
 
     # Monitoring
     "DriftDetector",

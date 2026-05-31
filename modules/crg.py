@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import numpy as np
-from typing import Dict, List, Optional, Tuple
 
 from engine.tensor import Tensor, Parameter
 from engine.module import Module
@@ -31,22 +32,35 @@ class CausalRoutingGraph(Module):
         self.n_lags = config.n_lags
         self.update_interval = config.update_interval
         self.edge_threshold = 0.01
-        # Partial-correlation threshold for causal vs associative labelling
         self.ci_threshold: float = getattr(config, "ci_threshold", 0.05)
+        self.n_regimes: int = getattr(config, "n_regimes", 4)
 
-        # Adjacency matrix: W_ij = edge strength from node i to node j
+        # Base adjacency matrix: W_ij = edge strength from node i to node j
         w_init = np.random.randn(config.n_nodes, config.n_nodes).astype(np.float64) * 0.01
-        np.fill_diagonal(w_init, 0.0)   # no self-loops
+        np.fill_diagonal(w_init, 0.0)
         self.W = Parameter(w_init, name="W")
+
+        # Neural Granger mask: M_ij learned logits; sigmoid(M_ij) gates each edge.
+        # Initialized to 0 → sigmoid(0)=0.5 (neutral); L1 penalty drives unused
+        # edges toward −∞ (sigmoid→0) during training.
+        m_init = np.zeros((config.n_nodes, config.n_nodes), dtype=np.float32)
+        np.fill_diagonal(m_init, -10.0)   # hard-zero self-loops from the start
+        self.M = Parameter(m_init, name="M")
+
+        # Regime-conditioned bias: one additive W adjustment per regime.
+        # W_eff = (W + sum_k(w_k * W_bias_k)) * sigmoid(M)
+        # Allows different causal structures per operating regime.
+        self.W_regime_bias = Parameter(
+            np.zeros((self.n_regimes, config.n_nodes, config.n_nodes), dtype=np.float32),
+            name="W_regime_bias"
+        )
 
         self.node_embed = Linear(d_model, config.n_nodes)
         self.node_out = Linear(config.n_nodes, d_model)
 
-        # Non-parameter state
         object.__setattr__(self, "step_counter", 0)
         object.__setattr__(self, "granger_accumulator",
-                           np.zeros((config.n_nodes, config.n_nodes), dtype=np.float64))
-        # edge_labels[i][j] = EDGE_CAUSAL | EDGE_ASSOCIATIVE
+                           np.zeros((config.n_nodes, config.n_nodes), dtype=np.float32))
         object.__setattr__(self, "edge_labels", {})
 
     # ------------------------------------------------------------------
@@ -54,7 +68,7 @@ class CausalRoutingGraph(Module):
     # ------------------------------------------------------------------
 
     def _partial_correlation(
-        self, x: np.ndarray, i: int, j: int, cond: List[int]
+        self, x: np.ndarray, i: int, j: int, cond: list[int]
     ) -> float:
         """
         Partial correlation of columns i and j conditioned on `cond` columns.
@@ -94,7 +108,7 @@ class CausalRoutingGraph(Module):
         denom = np.std(ri_dm) * np.std(rj_dm) + 1e-8
         return float(np.mean(ri_dm * rj_dm) / denom)
 
-    def _top_confounders(self, x: np.ndarray, i: int, j: int, k: int = 2) -> List[int]:
+    def _top_confounders(self, x: np.ndarray, i: int, j: int, k: int = 2) -> list[int]:
         """
         Return the k node indices (excluding i, j) whose time-series are most
         correlated with both x[:, i] and x[:, j].  These are the conditioning
@@ -130,7 +144,7 @@ class CausalRoutingGraph(Module):
         x_history : (T, N) float64
         """
         W_data = self.W.data
-        labels: Dict[Tuple[int, int], str] = {}
+        labels: dict[tuple[int, int], str] = {}
 
         rows, cols = np.where(np.abs(W_data) > self.edge_threshold)
         for i, j in zip(rows.tolist(), cols.tolist()):
@@ -150,28 +164,51 @@ class CausalRoutingGraph(Module):
     # ------------------------------------------------------------------
 
     def _dag_penalty(self) -> Tensor:
-        from scipy.linalg import expm as scipy_expm
-        n = self.n_nodes
-        W_np = self.W.data           # (n, n) numpy float64
-        A_np = W_np ** 2             # element-wise square
-        expm_A = scipy_expm(A_np)    # (n, n) exact matrix exponential
-        trace_val = float(np.trace(expm_A))
+        """
+        DAGMA acyclicity penalty (Yu et al. 2023):
+            h(W) = -log det(s·I - W⊙W) - n·log(s)
+
+        Strictly acyclic iff h(W) = 0. Unlike NOTEARS' tr(exp(W²))-n this is:
+          - Strictly convex in a neighbourhood of the DAG solution
+          - O(n³) via Cholesky instead of matrix exponential (same cost, better numerics)
+          - Better-conditioned: no exponential blow-up of eigenvalues
+
+        Gradient: d(h)/d(W_ij) = 2·W_ij·[(s·I - W⊙W)^{-1}]_ji
+        """
+        n  = self.n_nodes
+        s  = float(n) / 2.0 + 1.0      # s > spectral_radius(W⊙W); n/2+1 is a safe default
+        W  = self.W.data                # (n, n)
+        M  = s * np.eye(n) - W * W      # s·I - W⊙W  (must be positive definite for DAG)
+
+        # Clamp to ensure positive definiteness even if W is large early in training
+        M  = M + np.eye(n) * 1e-6
+        try:
+            sign, log_abs_det = np.linalg.slogdet(M)
+        except np.linalg.LinAlgError:
+            sign, log_abs_det = 1.0, 0.0
+
+        # h = -log|det(M)| - n·log(s)
+        h_val = float(-sign * log_abs_det - n * np.log(s + 1e-8))
 
         out = Tensor(
-            np.array([[trace_val - n]], dtype=np.float64),
+            np.array([[h_val]], dtype=np.float32),
             requires_grad=self.W.requires_grad,
             _children=(self.W,),
-            _op="dag_penalty"
+            _op="dagma_penalty"
         )
-
-        _W = self.W
-        _expm_A = expm_A.copy()
+        _W  = self.W
+        _M  = M.copy()
+        _s  = s
 
         def _back():
             if _W.requires_grad and out.grad is not None:
                 g_scalar = float(out.grad.sum())
-                # Analytic: d(tr(expm(W²)))/d(W_ij) = 2 * W_ij * expm(W²)_ij
-                contrib = 2.0 * _W.data * _expm_A * g_scalar
+                try:
+                    M_inv = np.linalg.inv(_M)
+                except np.linalg.LinAlgError:
+                    return
+                # d(h)/d(W_ij) = 2·W_ij·(M^{-1})_ji
+                contrib = (2.0 * _W.data * M_inv.T * g_scalar).astype(np.float32)
                 _W.grad = _W.grad + contrib if _W.grad is not None else contrib
 
         out._backward = _back
@@ -204,20 +241,45 @@ class CausalRoutingGraph(Module):
         messages = node_states @ W_t       # (B, T, n_nodes) @ (n_nodes, n_nodes)
         return node_states + messages
 
-    def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+    def _effective_W(self, regime_weights: np.ndarray | None = None) -> np.ndarray:
         """
-        x: (batch, T, d_model)
+        Compute the effective adjacency matrix:
+          W_eff = (W_base + regime_adjustment) * sigmoid(M)
+
+        regime_weights : (K,) mean routing weights per regime, or None.
+        Returns (n_nodes, n_nodes) float64.
+        """
+        W_base = self.W.data.copy()
+
+        # Regime-conditioned adjustment: blend K bias matrices by routing weights
+        if regime_weights is not None and len(regime_weights) == self.n_regimes:
+            rw = np.asarray(regime_weights, dtype=np.float32)
+            rw = rw / (rw.sum() + 1e-8)     # normalise to sum=1
+            regime_adj = np.einsum("k,kij->ij", rw, self.W_regime_bias.data)
+            W_base = W_base + regime_adj
+
+        # Neural Granger gate: sigmoid(M) masks each edge independently
+        gate = 1.0 / (1.0 + np.exp(-np.clip(self.M.data, -20, 20)))
+        W_eff = W_base * gate
+        np.fill_diagonal(W_eff, 0.0)
+        return W_eff
+
+    def forward(self, x: Tensor,
+                regime_weights: np.ndarray | None = None) -> tuple[Tensor, Tensor]:
+        """
+        x              : (batch, T, d_model)
+        regime_weights : optional (K,) mean per-regime routing weights from RMC;
+                         when provided, blends regime-specific causal graph biases.
         Returns (output, dag_penalty):
             output     : (batch, T, d_model)
-            dag_penalty: scalar Tensor
+            dag_penalty: scalar Tensor (DAG + L1 + Granger mask sparsity)
         """
         # Project to node space
         node_states = self.node_embed(x)    # (B, T, n_nodes)
 
-        # Sparse adjacency: zero out edges below threshold
-        W_data = self.W.data.copy()
-        np.fill_diagonal(W_data, 0.0)
-        W_sparse = np.where(np.abs(W_data) > self.edge_threshold, W_data, 0.0)
+        # Effective adjacency: base W gated by learned Granger mask, regime-adjusted
+        W_eff = self._effective_W(regime_weights)
+        W_sparse = np.where(np.abs(W_eff) > self.edge_threshold, W_eff, 0.0)
 
         # Message passing (differentiable)
         updated = self._message_pass(node_states, W_sparse)   # (B, T, n_nodes)
@@ -225,12 +287,30 @@ class CausalRoutingGraph(Module):
         # Project back to d_model
         output = self.node_out(updated)     # (B, T, d_model)
 
-        # DAG penalty
+        # DAG penalty on W_eff
         dag_pen = self._dag_penalty()       # scalar Tensor
 
-        # L1 sparsity penalty on W (as part of dag_pen for caller convenience)
-        l1 = self.W.abs().sum() * self.sparsity_lambda
-        total_penalty = dag_pen * self.dag_lambda + l1
+        # L1 on W
+        l1_W = self.W.abs().sum() * self.sparsity_lambda
+        # L1 on sigmoid(M): encourages sparse Granger mask (drives unused edges to 0)
+        gate_t = Tensor(
+            1.0 / (1.0 + np.exp(-np.clip(self.M.data, -20, 20))),
+            requires_grad=self.M.requires_grad,
+            _children=(self.M,), _op="granger_gate"
+        )
+        _M = self.M
+        _gate_np = gate_t.data.copy()
+
+        def _gate_back():
+            if _M.requires_grad and gate_t.grad is not None:
+                dsig = _gate_np * (1.0 - _gate_np)
+                contrib = gate_t.grad * dsig
+                _M.grad = _M.grad + contrib if _M.grad is not None else contrib
+
+        gate_t._backward = _gate_back
+        l1_M = gate_t.abs().sum() * self.sparsity_lambda
+
+        total_penalty = dag_pen * self.dag_lambda + l1_W + l1_M
 
         # CRG collapse guard: reset W if NaN/Inf contamination detected
         if not np.all(np.isfinite(self.W.data)):
@@ -240,7 +320,7 @@ class CausalRoutingGraph(Module):
             if self.W.grad is not None:
                 self.W.grad[:] = 0.0
             object.__setattr__(self, "granger_accumulator",
-                               np.zeros((self.n_nodes, self.n_nodes), dtype=np.float64))
+                               np.zeros((self.n_nodes, self.n_nodes), dtype=np.float32))
 
         # Online structure discovery (every update_interval steps, training only)
         if self.training:
@@ -264,7 +344,7 @@ class CausalRoutingGraph(Module):
         if T < self.n_lags + 2:
             return
 
-        G = np.zeros((N, N), dtype=np.float64)
+        G = np.zeros((N, N), dtype=np.float32)
         for lag in range(1, self.n_lags + 1):
             x_past = x_history[:-lag, :]    # (T-lag, N)
             x_fut = x_history[lag:, :]      # (T-lag, N)
@@ -294,10 +374,34 @@ class CausalRoutingGraph(Module):
         self.W.data += lr_struct * (new_acc - np.abs(self.W.data))
         np.fill_diagonal(self.W.data, 0.0)
 
+        # Update Neural Granger mask M: edges with strong Granger signal get
+        # positive logits (gate → 1); edges with weak signal get negative logits
+        # (gate → 0). Uses a slow learning rate so gradient training dominates.
+        lr_mask = 5e-4
+        granger_signal = new_acc / (new_acc.max() + 1e-8)  # normalise to [0,1]
+        # Push M toward +3 for strong edges, -3 for weak edges
+        target_M = (granger_signal - 0.5) * 6.0
+        np.fill_diagonal(target_M, -10.0)
+        self.M.data += lr_mask * (target_M - self.M.data)
+
         # Conditional independence pruning: remove spurious correlational edges
         self._prune_spurious_edges(x_history)
 
-    def explain(self, query_node_idx: int) -> List[Tuple[int, float]]:
+        # Write strong causal edges to attached CausalMemory (if any)
+        if getattr(self, "_causal_memory", None) is not None:
+            rows, cols = np.where(new_acc > 0.1)
+            for i, j in zip(rows.tolist(), cols.tolist()):
+                if i != j:
+                    self._causal_memory.record(
+                        cause=int(i), effect=int(j),
+                        confidence=float(new_acc[i, j])
+                    )
+
+    def attach_causal_memory(self, causal_memory) -> None:
+        """Attach a CausalMemory instance; CRG writes discovered edges into it."""
+        object.__setattr__(self, "_causal_memory", causal_memory)
+
+    def explain(self, query_node_idx: int) -> list[tuple[int, float]]:
         """
         Trace influential predecessors of query_node via BFS over strongest edges.
         Returns list of (node_idx, cumulative_weight) sorted by descending influence.
@@ -335,13 +439,71 @@ class CausalRoutingGraph(Module):
         results.sort(key=lambda t: t[1], reverse=True)
         return results
 
+    def propagate_failure(
+        self,
+        triggered_nodes: list[int],
+        edge_threshold: float | None = None,
+        max_hops: int = 4,
+        decay: float = 0.85,
+    ) -> list[tuple[int, float]]:
+        """
+        Forward-propagate failure signals through the causal graph.
+
+        Given a set of nodes where an anomaly was detected, follows causal edges
+        forward to find downstream nodes likely to be affected.  Failure
+        probability decays with each hop and with edge weight.
+
+        Parameters
+        ----------
+        triggered_nodes : node indices where the anomaly fired
+        edge_threshold  : minimum |W_eff| to follow; default self.edge_threshold
+        max_hops        : maximum propagation depth
+        decay           : per-hop probability decay factor (0 < decay ≤ 1)
+
+        Returns
+        -------
+        list of (node_idx, failure_probability) sorted descending, excluding
+        the trigger nodes themselves.
+        """
+        thr = edge_threshold if edge_threshold is not None else self.edge_threshold
+        W_eff = self._effective_W()
+        W_sparse = np.where(np.abs(W_eff) > thr, W_eff, 0.0)
+
+        # Seed failure probabilities at trigger nodes
+        failure_prob: dict[int, float] = {n: 1.0 for n in triggered_nodes}
+        frontier = list(set(triggered_nodes))
+
+        for hop in range(max_hops):
+            next_frontier: list[int] = []
+            for src in frontier:
+                for dst in range(self.n_nodes):
+                    if dst == src:
+                        continue
+                    w = float(W_sparse[src, dst])
+                    if abs(w) < thr:
+                        continue
+                    # Probability = parent_prob × |edge_weight| × decay^hop
+                    new_prob = failure_prob[src] * abs(w) * (decay ** hop)
+                    if dst not in failure_prob or failure_prob[dst] < new_prob:
+                        failure_prob[dst] = new_prob
+                        next_frontier.append(dst)
+            frontier = list(set(next_frontier))
+            if not frontier:
+                break
+
+        triggered_set = set(triggered_nodes)
+        results = [(node, prob) for node, prob in failure_prob.items()
+                   if node not in triggered_set]
+        results.sort(key=lambda t: t[1], reverse=True)
+        return results
+
     # ------------------------------------------------------------------
     # do-calculus intervention API
     # ------------------------------------------------------------------
 
     def intervene(
         self,
-        node_interventions: Dict[int, float],
+        node_interventions: dict[int, float],
         x: Tensor,
     ) -> Tensor:
         """
@@ -393,8 +555,8 @@ class CausalRoutingGraph(Module):
         self,
         x: Tensor,
         target_node: int,
-        candidate_nodes: Optional[List[int]] = None,
-        intervention_values: Optional[Dict[int, float]] = None,
+        candidate_nodes: list[int] | None = None,
+        intervention_values: dict[int, float] | None = None,
         top_k: int = 5,
     ) -> dict:
         """
@@ -472,14 +634,14 @@ class CausalRoutingGraph(Module):
             "n_candidates":  len(candidate_nodes),
         }
 
-    def get_active_edges(self) -> List[Tuple[int, int, float, str]]:
+    def get_active_edges(self) -> list[tuple[int, int, float, str]]:
         """Returns list of (i, j, weight, label) for |W_ij| > edge_threshold.
 
         `label` is 'causal' or 'associative' (set after update_structure).
         Newly added edges before the first CI test carry label 'causal'.
         """
         W_data = self.W.data
-        labels: Dict[Tuple[int, int], str] = self.edge_labels
+        labels: dict[tuple[int, int], str] = self.edge_labels
         edges = []
         rows, cols = np.where(np.abs(W_data) > self.edge_threshold)
         for i, j in zip(rows.tolist(), cols.tolist()):

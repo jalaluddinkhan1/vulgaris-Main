@@ -22,9 +22,10 @@ Usage
             idx = indices[start : start + batch_size]
             x, y = my_dataset[idx]
             pipeline.train_step(x, y)
+from __future__ import annotations
+
 """
 
-from __future__ import annotations
 
 import numpy as np
 from typing import List, Optional

@@ -20,9 +20,10 @@ Usage
 
     # Integration with TrainingPipeline:
     pipeline.active_step(x_pool, x_labeled, y_labeled, n_query=10)
+from __future__ import annotations
+
 """
 
-from __future__ import annotations
 
 import numpy as np
 from typing import List, Optional

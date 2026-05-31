@@ -46,15 +46,16 @@ Severity
 --------
   0 = low, 1 = medium (default), 2 = high, 3 = critical
   Scales the penalty contribution of this rule in RuleConditionLoss.
+from __future__ import annotations
+
 """
 
-from __future__ import annotations
 
 import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 
@@ -66,10 +67,10 @@ from engine.layers import Linear
 _RULE_DIM = 10        # length of per-rule encoding vector
 _MAX_RULES = 32       # maximum rules per domain (pad with zeros)
 
-_OP_MAP: Dict[str, float]   = {">": 1.0, ">=": 0.8, "<": -1.0, "<=": -0.8, "==": 0.0}
-_CONS_MAP: Dict[str, int]   = {"alert": 0, "clamp_output": 1,
+_OP_MAP: dict[str, float]   = {">": 1.0, ">=": 0.8, "<": -1.0, "<=": -0.8, "==": 0.0}
+_CONS_MAP: dict[str, int]   = {"alert": 0, "clamp_output": 1,
                                 "suppress": 2, "boost": 3, "noop": 4}
-_INV_CONS: Dict[int, str]   = {v: k for k, v in _CONS_MAP.items()}
+_INV_CONS: dict[int, str]   = {v: k for k, v in _CONS_MAP.items()}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -201,26 +202,26 @@ class RuleRegistry:
 
     def __init__(self, max_rules: int = _MAX_RULES):
         self.max_rules = max_rules
-        self._store: Dict[int, List[Rule]] = {}
+        self._store: dict[int, list[Rule]] = {}
 
     # ------------------------------------------------------------------
 
-    def register(self, domain_idx: int, rules: List[Rule]) -> None:
+    def register(self, domain_idx: int, rules: list[Rule]) -> None:
         """Register (or replace) rules for a domain."""
         self._store[domain_idx] = list(rules)
 
-    def register_from_dicts(self, domain_idx: int, rule_dicts: List[dict]) -> None:
+    def register_from_dicts(self, domain_idx: int, rule_dicts: list[dict]) -> None:
         """Convenience: parse and register from list of plain dicts."""
         self.register(domain_idx, [Rule.from_dict(d) for d in rule_dicts])
 
-    def get(self, domain_idx: int) -> List[Rule]:
+    def get(self, domain_idx: int) -> list[Rule]:
         """Return rules for domain, or [] if none registered."""
         return self._store.get(domain_idx, [])
 
     def has_rules(self, domain_idx: int) -> bool:
         return bool(self._store.get(domain_idx))
 
-    def all_domains(self) -> List[int]:
+    def all_domains(self) -> list[int]:
         return list(self._store.keys())
 
     def encode_domain(self, domain_idx: int) -> np.ndarray:
@@ -249,7 +250,7 @@ class RuleRegistry:
         return len(self._store[domain_idx]) < before
 
     def update_rule(self, domain_idx: int, name: str,
-                    updates: Dict[str, Any]) -> bool:
+                    updates: dict[str, Any]) -> bool:
         """Patch fields on a named rule. Returns True if rule was found."""
         for rule in self._store.get(domain_idx, []):
             if rule.name == name:
@@ -261,7 +262,7 @@ class RuleRegistry:
 
     def save(self, path: str) -> None:
         """Persist registry to a JSON file (human-readable, version-controlled)."""
-        data: Dict[str, Any] = {}
+        data: dict[str, Any] = {}
         for domain_idx, rules in self._store.items():
             data[str(domain_idx)] = [r.to_dict() for r in rules]
         with open(path, "w") as f:
@@ -389,7 +390,7 @@ class RuleConditionLoss:
         self,
         x_input: np.ndarray,   # (B, n_features) — input features at current step
         output:  np.ndarray,   # (B, out_dim)    — model output
-        rules:   List[Rule],
+        rules:   list[Rule],
     ) -> Tensor:
         """
         Compute scalar rule-violation penalty.
@@ -483,10 +484,10 @@ class RuleDistiller:
 
     def compare(
         self,
-        cart_rules:       List[str],
-        registered_rules: List[Rule],
+        cart_rules:       list[str],
+        registered_rules: list[Rule],
         threshold_rtol:   float = 0.15,
-        feature_names:    Optional[List[str]] = None,
+        feature_names:    list[str] | None = None,
     ) -> dict:
         """
         Parameters
@@ -565,7 +566,7 @@ class RuleDistiller:
 
     # ------------------------------------------------------------------
 
-    def _parse_cart(self, cart_rules: List[str]) -> List[dict]:
+    def _parse_cart(self, cart_rules: list[str]) -> list[dict]:
         """Extract (feature_name, op, threshold) from CART rule strings."""
         conds = []
         for rule_str in cart_rules:
@@ -582,7 +583,7 @@ class RuleDistiller:
         return conds
 
     @staticmethod
-    def _feat_idx(feat_str: str) -> Optional[int]:
+    def _feat_idx(feat_str: str) -> int | None:
         """Extract integer index from 'feat[3]' or 'h_3' style names."""
         m = re.search(r"\[(\d+)\]", feat_str)
         if m:
@@ -593,9 +594,9 @@ class RuleDistiller:
         return None
 
     def _find_match(
-        self, rule: Rule, cart_conds: List[dict],
-        rtol: float, feature_names: Optional[List[str]],
-    ) -> Optional[dict]:
+        self, rule: Rule, cart_conds: list[dict],
+        rtol: float, feature_names: list[str] | None,
+    ) -> dict | None:
         """Find the CART condition that best matches `rule` by feature index."""
         reg_fname = (feature_names[rule.feature]
                      if feature_names and rule.feature < len(feature_names)
@@ -688,7 +689,7 @@ class RuleLifecycleManager:
         self.decay_half_life = decay_half_life
         self.merge_rtol      = merge_rtol
         self.cart_init_conf  = cart_init_conf
-        self._log: List[_RuleEvent] = []
+        self._log: list[_RuleEvent] = []
 
     # ------------------------------------------------------------------
     # 1. Update confidence from feedback
@@ -786,7 +787,7 @@ class RuleLifecycleManager:
     # 3. Prune stale / unreliable rules
     # ------------------------------------------------------------------
 
-    def prune(self, domain_idx: int, step: int) -> List[str]:
+    def prune(self, domain_idx: int, step: int) -> list[str]:
         """
         Remove non-manual rules where:
           support_count >= min_support  AND  confidence < min_confidence
@@ -902,11 +903,11 @@ class RuleLifecycleManager:
     def absorb_from_cart(
         self,
         domain_idx:     int,
-        cart_rules:     List[str],   # strings from ESE CARTExtractor.extract_rules()
+        cart_rules:     list[str],   # strings from ESE CARTExtractor.extract_rules()
         step:           int,
-        feature_names:  Optional[List[str]] = None,
+        feature_names:  list[str] | None = None,
         max_new:        int = 8,
-    ) -> List[Rule]:
+    ) -> list[Rule]:
         """
         Diff CART-extracted rules against the registry.
 
@@ -943,12 +944,12 @@ class RuleLifecycleManager:
         # --- Absorb emergent conditions ----------------------------------
         # Count feature occurrences across all CART conditions
         all_conds   = distiller._parse_cart(cart_rules)
-        feat_counts: Dict[Optional[int], int] = {}
+        feat_counts: dict[int | None, int] = {}
         for c in all_conds:
             k = c["feature_idx"]
             feat_counts[k] = feat_counts.get(k, 0) + 1
 
-        new_rules: List[Rule] = []
+        new_rules: list[Rule] = []
         registered_features   = {r.feature for r in self.registry.get(domain_idx)}
 
         for emergent in report["emergent"][:max_new]:
@@ -994,8 +995,8 @@ class RuleLifecycleManager:
     # Audit log
     # ------------------------------------------------------------------
 
-    def get_log(self, domain_idx: Optional[int] = None,
-                action: Optional[str] = None) -> List[dict]:
+    def get_log(self, domain_idx: int | None = None,
+                action: str | None = None) -> list[dict]:
         """Return audit log, optionally filtered by domain or action type."""
         entries = self._log
         if domain_idx is not None:

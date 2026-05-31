@@ -31,6 +31,12 @@ Complete mathematical reference for every algorithm used in VULGARIS.
 23. [Drift Detection — KS, MMD & Wasserstein](#23-drift-detection--ks-mmd--wasserstein)
 24. [Degradation & Serving Infrastructure](#24-degradation--serving-infrastructure)
 25. [Benchmarking — Datasets, Metrics & Baselines](#25-benchmarking--datasets-metrics--baselines)
+26. [RMC — Regime Mixture Core](#26-rmc--regime-mixture-core)
+27. [Knowledge Distillation](#27-knowledge-distillation)
+28. [Active Learning — Pool-Based Uncertainty Sampling](#28-active-learning--pool-based-uncertainty-sampling)
+29. [Speculative Rollout — Draft-Verify Autoregressive Decoding](#29-speculative-rollout--draft-verify-autoregressive-decoding)
+30. [ICL — In-Context Learning](#30-icl--in-context-learning)
+31. [Ontology Embedding — Industrial Semantic Context](#31-ontology-embedding--industrial-semantic-context)
 
 ---
 
@@ -1716,3 +1722,321 @@ FLOPs estimate:  2 × n_params  (weight multiply-accumulate count)
 ---
 
 *Generated from source at `d:\Microsoft\Vulgaris`. All equations derived from actual implementation in the corresponding Python files.*
+
+---
+
+## 26. RMC — Regime Mixture Core
+
+**File:** `modules/rmc.py`
+
+Switch-Transformer-style soft Mixture-of-Experts that routes each token independently to a weighted combination of K linear experts, with an auxiliary load-balancing loss to prevent expert collapse.
+
+### Gating
+
+Given input $\mathbf{x} \in \mathbb{R}^{B \times T \times d}$, a learned gate linear layer produces unnormalised logits which are scaled by temperature $\tau$ and normalised via softmax:
+
+```
+logits = x @ W_gate.T                        shape (B, T, K)
+g = softmax(logits / τ)                      routing weights
+```
+
+### Expert Computation
+
+K independent linear experts, each mapping $\mathbb{R}^d \to \mathbb{R}^d$:
+
+```
+e_k(x) = x @ W_k.T + b_k                    k = 1 … K
+
+out = Σ_k  g[:,:,k:k+1] · e_k(x)            weighted sum of expert outputs
+```
+
+### Load-Balancing Loss
+
+Hard expert assignment (no gradient):
+
+```
+a = argmax(logits, axis=-1)                  shape (B, T)
+f_k = mean over (B,T) of [a == k]            fraction of tokens hard-routed to k
+P_k = mean over (B,T) of g[:,:,k]            mean routing probability (differentiable)
+
+L_balance = balance_weight · K · Σ_k  f_k · P_k
+```
+
+This loss (Fedus et al., 2021) penalises configurations where $f_k$ and $P_k$ are simultaneously large for the same expert, pushing the router towards uniform utilisation without using a non-differentiable operation in the backward pass.
+
+### Regime Assignments
+
+```
+regime_assignments() → argmax(logits, axis=-1)    (B, T)  int64
+```
+
+Returns the single most-likely expert index per token, used downstream for interpretability and per-regime metric tracking.
+
+**Design decisions:**
+- Temperature $\tau > 1$ softens the routing distribution, smoothing gradients early in training; $\tau = 1$ recovers hard top-1 routing in the limit.
+- Experts are plain Linear layers (no bias on $W_k$) keeping the module parameter count at $K \times d^2$ — O(1) in sequence length.
+- The load-balancing coefficient `balance_weight` defaults to 0.01 and is exposed in `RMCConfig`.
+
+---
+
+## 27. Knowledge Distillation
+
+**File:** `training/distillation.py`
+
+Hinton (2015) knowledge distillation: a smaller student model is trained to match the soft probability distribution produced by a larger, frozen teacher model, in addition to fitting the hard ground-truth labels.
+
+### Temperature-Scaled Soft Targets
+
+For a batch of inputs, both teacher and student produce logit vectors. Soft probabilities at temperature $T$:
+
+```
+p_teacher = softmax(z_teacher / T)
+p_student = softmax(z_student / T)
+```
+
+The soft-target loss is the KL divergence scaled by $T^2$ (the $T^2$ factor compensates for the $1/T$ gradient shrinkage):
+
+```
+L_soft = T² · KL(p_teacher ‖ p_student)
+       = T² · Σ_c  p_teacher_c · log(p_teacher_c / p_student_c)
+```
+
+### Hint Loss
+
+Intermediate layer representations can be aligned via MSE. When teacher and student have different hidden dimensions, `DistillationTrainer` auto-creates a linear projector $W_h \in \mathbb{R}^{d_s \times d_t}$:
+
+```
+h_student_proj = h_student @ W_h.T          (d_t-dimensional)
+L_hint = (1/BT) · ‖h_student_proj − h_teacher‖²_F
+```
+
+### Combined Loss
+
+```
+L = α · L_hard + (1 − α) · (T² · L_soft + β · L_hint)
+```
+
+where $\alpha$ balances hard and soft objectives and $\beta$ weights the hint term independently.
+
+### DistillationTrainer
+
+```
+1. Freeze all teacher parameters (requires_grad = False for all W, b).
+2. For each batch:
+   a. Forward teacher (no gradient tape).
+   b. Forward student.
+   c. Compute L_hard, L_soft, L_hint.
+   d. Backward on student only.
+   e. Optimizer step on student parameters.
+```
+
+**Design decisions:**
+- Teacher freeze is enforced in `__init__`, not per-step, so gradient computation for teacher parameters never allocates memory.
+- The hint projector is created lazily on the first forward pass, after tensor shapes are known.
+- Default $T = 4$, $\alpha = 0.5$, $\beta = 0.1$ — all configurable.
+
+---
+
+## 28. Active Learning — Pool-Based Uncertainty Sampling
+
+**File:** `training/active_learning.py`
+
+Pool-based active learning selects the most informative unlabelled examples from a fixed candidate pool to query for annotation, maximising model improvement per labelling cost.
+
+### Acquisition Functions
+
+Given model output $\mathbf{p} \in \mathbb{R}^{B \times C}$ (softmax probabilities over C classes):
+
+**Uncertainty (output variance):**
+
+```
+score = var(p, axis=-1)         scalar variance across class probs
+```
+
+**Entropy (Shannon):**
+
+```
+score = −Σ_c  p_c · log(p_c + ε)
+```
+
+**Margin (top-2 difference):**
+
+```
+p_sorted = sort(p, descending=True)
+score = −(p_sorted[:,0] − p_sorted[:,1])    (negative so higher = more uncertain)
+```
+
+**Random:**
+
+```
+score = uniform(0, 1, size=B)
+```
+
+### MC Dropout
+
+When `n_mc > 1`, the model is queried $n_{\text{mc}}$ times with dropout active; the per-sample mean output is used for entropy and margin, and the per-sample variance across runs is used for the uncertainty acquisition:
+
+```
+p_runs = stack([model(x_pool, training=True) for _ in range(n_mc)])   (n_mc, B, C)
+p_mean = mean(p_runs, axis=0)
+score_uncertainty = var(p_runs, axis=0).mean(axis=-1)
+```
+
+### Query
+
+```
+query(pool, k):
+  scores = acquisition(pool)
+  scores[labeled_set] = −∞               exclude already-labelled indices
+  indices = argsort(scores)[-k:]          top-k highest uncertainty
+  labeled_set ∪= indices
+  return indices
+```
+
+**Design decisions:**
+- The labeled set is maintained as a Python `set` of integer indices. Exclusion is O(1) per index.
+- Acquisition function is selected by string name at construction time, not per-call, to avoid repeated dispatch overhead in large loops.
+
+---
+
+## 29. Speculative Rollout — Draft-Verify Autoregressive Decoding
+
+**File:** `inference/speculative.py`
+
+Speculative decoding (Leviathan et al., 2023) accelerates autoregressive generation by using a cheap draft model to propose $\gamma$ future steps, then verifying them in a single forward pass of the full model. VULGARIS adapts this to latent-space regression via an infinity-norm acceptance criterion.
+
+### Draft Phase
+
+`WorldModelHead` maps the current latent state $\mathbf{z}_t$ to a sequence of $\gamma$ draft predictions autoregressively in latent space:
+
+```
+z_draft_0 = z_t
+for i in 1 … γ:
+    z_draft_i = WorldModelHead(z_draft_{i-1})    (lightweight MLP)
+y_draft = output_head(z_draft_γ)
+```
+
+### Verify Phase
+
+The full VULGARIS model is advanced $\gamma$ steps from $\mathbf{z}_t$:
+
+```
+z_verify_γ, _ = model.step_n(x_{t+1:t+γ}, state_t)
+y_verify = output_head(z_verify_γ)
+```
+
+### Acceptance Criterion
+
+```
+δ = ‖y_draft − y_verify‖_∞
+
+if δ < threshold:
+    accept draft; advance state to z_draft_γ
+    accepted_steps += γ
+else:
+    reject; state stays at z_verify_γ (full model advance is not wasted)
+    accepted_steps += 0
+```
+
+### Statistics
+
+```
+acceptance_rate   = accepted_steps / total_proposed_steps
+effective_speedup = (accepted_steps · γ + rejected_steps) / total_full_model_steps
+```
+
+**Design decisions:**
+- The infinity-norm criterion is conservative (it bounds worst-case per-output-dimension error) and avoids requiring calibrated per-output thresholds.
+- On rejection the full model's verified state is retained, so no computation is discarded.
+- `rollout_single()` exposes a simplified path: draft exactly one step, verify, return accepted output.
+
+---
+
+## 30. ICL — In-Context Learning
+
+**File:** `modules/icl.py`
+
+Zero-shot adaptation at inference time without weight updates: a small set of reference (context) examples is encoded into a context vector which is injected into the main stream via cross-attention with a gated residual.
+
+### ContextEncoder
+
+Given $N$ reference examples $\{(\mathbf{x}^{(i)}, \mathbf{y}^{(i)})\}_{i=1}^N$, each pair is independently encoded and mean-pooled:
+
+```
+h_i = MLP([x_i ‖ y_i])                      per-example encoding
+c   = (1/N) · Σ_i h_i                        context vector  ∈ ℝ^{d_ctx}
+```
+
+### InContextAdapter (Cross-Attention)
+
+The main stream query $\mathbf{q} \in \mathbb{R}^{B \times T \times d}$ attends to the context:
+
+```
+Q = q @ W_Q
+K = c @ W_K                                  context keys (broadcast over B, T)
+V = c @ W_V                                  context values
+
+A = softmax(Q @ K.T / √d_head)
+ctx_out = A @ V                               cross-attended context  ∈ ℝ^{B×T×d}
+```
+
+### Gated Residual
+
+The context output is mixed into the main stream with a scalar gate $g$ initialised near zero, so early training leaves the base model unmodified:
+
+```
+g = sigmoid(g_raw)                            g_raw initialised to small negative value
+h_out = h + g · ctx_out
+```
+
+Near-zero gate initialisation is critical: it ensures the adapter is a near-identity at the start of fine-tuning and does not disrupt pretrained representations.
+
+**Design decisions:**
+- Mean-pooling over context examples is permutation-invariant and makes the adapter robust to context ordering.
+- Gate is a single scalar per adapter (not per-head), minimising the number of parameters that require initialisation care.
+- `ICLConfig.max_context` caps N at inference time to bound the cross-attention compute.
+
+---
+
+## 31. Ontology Embedding — Industrial Semantic Context
+
+**File:** `modules/ontology_embedding.py`
+
+A lightweight structured vocabulary of industrial terminology that injects domain-semantic priors into the model's embedding space without requiring a full language model.
+
+### Term Vocabulary
+
+80 industrial terms are grouped into 12 semantic clusters (e.g., *thermal*, *vibration*, *electrical*, *control*, *network*, *safety*). Each term is a short string; the vocabulary is hardcoded in the module and versioned with the model.
+
+### Cluster Embedding
+
+Each of the 12 clusters is assigned a learned embedding $\mathbf{e}_k \in \mathbb{R}^{d_{\text{ont}}}$. The embedding for a term in cluster $k$ is the cluster embedding (terms within a cluster share an embedding):
+
+```
+e_term = E[cluster_id[term]]                  E ∈ ℝ^{12 × d_ont}
+```
+
+### Domain Embedding
+
+Given a list of terms active in a domain, the domain embedding is the mean-pool of their term embeddings:
+
+```
+e_domain = (1/|terms|) · Σ_{t ∈ terms}  E[cluster_id[t]]
+```
+
+This vector is appended to the DAH domain conditioning signal, injecting semantic information about the domain into the hypernetwork.
+
+### OntologyRegistry
+
+```
+register(domain_name, term_list):
+    e_domain = mean_pool([E[cluster_id[t]] for t in term_list])
+    registry[domain_name] = e_domain
+
+lookup(domain_name) → e_domain ∈ ℝ^{d_ont}
+```
+
+**Design decisions:**
+- Sharing embeddings at cluster granularity (not per-term) reduces the parameter count from 80·d to 12·d while preserving the semantic grouping structure.
+- Mean-pooling is differentiable and order-invariant, so domain embeddings can be updated by gradient-based domain adaptation without requiring a fixed term ordering.
+- The 80-term vocabulary covers the major IEC 61131 / IEC 61508 / 3GPP industrial sensor categories; extensions are added by registering new terms to existing clusters.

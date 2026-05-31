@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Callable
 
 from engine.tensor import Tensor, Parameter, zeros
 from engine.module import Module
@@ -14,15 +16,15 @@ class DecisionNode:
     """Node in a CART decision tree."""
 
     def __init__(self):
-        self.feature_idx: Optional[int] = None
-        self.threshold: Optional[float] = None
-        self.left: Optional["DecisionNode"] = None
-        self.right: Optional["DecisionNode"] = None
+        self.feature_idx: int | None = None
+        self.threshold: float | None = None
+        self.left: DecisionNode | None = None
+        self.right: DecisionNode | None = None
         self.is_leaf: bool = False
-        self.prediction: Optional[float] = None   # majority class or mean
-        self.confidence: Optional[float] = None   # class probability or 1.0
+        self.prediction: float | None = None   # majority class or mean
+        self.confidence: float | None = None   # class probability or 1.0
         self.n_samples: int = 0
-        self.class_counts: Optional[dict] = None  # for classification rule text
+        self.class_counts: dict | None = None  # for classification rule text
 
 
 class CARTExtractor:
@@ -31,7 +33,7 @@ class CARTExtractor:
     def __init__(self, max_depth: int = 5, min_samples_split: int = 20):
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
-        self.root: Optional[DecisionNode] = None
+        self.root: DecisionNode | None = None
         self._is_classifier: bool = True
 
     # ------------------------------------------------------------------
@@ -64,7 +66,7 @@ class CARTExtractor:
     def _impurity(self, y: np.ndarray) -> float:
         return self._gini(y) if self._is_classifier else self._mse(y)
 
-    def _best_split(self, X: np.ndarray, y: np.ndarray) -> Tuple[int, float, float]:
+    def _best_split(self, X: np.ndarray, y: np.ndarray) -> tuple[int, float, float]:
         """Returns (feature_idx, threshold, gain).
 
         Iterates over each feature and a set of candidate thresholds,
@@ -171,14 +173,14 @@ class CARTExtractor:
     # Rule extraction
     # ------------------------------------------------------------------
 
-    def extract_rules(self, feature_names: Optional[List[str]] = None) -> List[str]:
+    def extract_rules(self, feature_names: list[str] | None = None) -> list[str]:
         """Walk tree, return list of IF-THEN rules as strings."""
         if self.root is None:
             return []
 
-        rules: List[str] = []
+        rules: list[str] = []
 
-        def _walk(node: DecisionNode, conditions: List[str]):
+        def _walk(node: DecisionNode, conditions: list[str]):
             if node.is_leaf:
                 cond_str = " AND ".join(conditions) if conditions else "TRUE"
                 if self._is_classifier:
@@ -211,7 +213,7 @@ class ExplainabilityEngine(Module):
     """Black-box elimination: rule extraction + attribution + counterfactual tracing."""
 
     def __init__(self, d_model: int, n_output: int, config: ESEConfig,
-                 feature_names: Optional[List[str]] = None):
+                 feature_names: list[str] | None = None):
         super().__init__()
         self.d_model = d_model
         self.n_output = n_output
@@ -265,7 +267,7 @@ class ExplainabilityEngine(Module):
     # ------------------------------------------------------------------
 
     def attribute(self, x: Tensor, y: Tensor,
-                  crg_W: Optional[np.ndarray] = None) -> np.ndarray:
+                  crg_W: np.ndarray | None = None) -> np.ndarray:
         """Gradient-based attribution + CRG weighting.
 
         x: (batch, T, d_model)
@@ -397,8 +399,8 @@ class ExplainabilityEngine(Module):
     # Full explanation pipeline
     # ------------------------------------------------------------------
 
-    def explain(self, x: Tensor, y: Tensor, crg_W: Optional[np.ndarray] = None,
-                feature_names: Optional[List[str]] = None) -> dict:
+    def explain(self, x: Tensor, y: Tensor, crg_W: np.ndarray | None = None,
+                feature_names: list[str] | None = None) -> dict:
         """Full explanation pipeline.
 
         Returns structured dict with attribution, rules, top_features.
@@ -409,7 +411,7 @@ class ExplainabilityEngine(Module):
         attr = self.attribute(x, y, crg_W=crg_W)
 
         # 2. Active rules from CART (if fitted)
-        rules: List[str] = []
+        rules: list[str] = []
         if self._cart_fitted:
             # Find rules matching the current latent
             h_np = x.data

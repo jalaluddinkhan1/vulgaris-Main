@@ -1,5 +1,5 @@
 [build-system]
-requires      = ["setuptools>=68", "wheel"]
+requires      = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # ─────────────────────────────────────────────────────────────────────────────
 [project]
 name        = "vulgaris"
-version     = "0.3.0"
+version     = "0.7.0"
 description = "Foundational industrial AI model for real-time telemetry, IoT, and time-series"
 readme      = "README.md"
 license     = "Apache-2.0"
@@ -97,10 +97,11 @@ include = [
     "federated*",
     "benchmarks*",
     "preprocessing*",
+    "memory*",
     "core*",
     "scripts*",
 ]
-exclude = ["tests*", "deploy*", "checkpoints*", "*.egg-info"]
+exclude = ["tests*", "deploy*", "checkpoints*", "*.egg-info", ".venv*"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
@@ -130,5 +131,15 @@ python_functions = ["test_*"]
 addopts = "-v --tb=short"
 
 [tool.coverage.run]
-source = ["engine", "modules", "model", "training", "vulgaris"]
-omit   = ["tests/*", "benchmarks/*", "deploy/*"]
+source = ["engine", "modules", "model", "training", "inference", "serve", "monitoring", "preprocessing", "federated", "vulgaris"]
+omit   = ["tests/*", "benchmarks/*", "deploy/*", ".venv*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+show_missing = true
+fail_under   = 60

@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import numpy as np
-from typing import List, Optional, Tuple
 
 from engine.tensor import Tensor, Parameter, zeros
 from engine.module import Module
@@ -30,8 +31,8 @@ class HTDLevel(Module):
         self.C_proj = Linear(state_dim, d_model)
         self.dt_proj = Linear(d_model, 1)
 
-    def forward(self, x: Tensor, h_prev: Optional[Tensor] = None,
-                bias: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, h_prev: Tensor | None = None,
+                bias: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """
         x     : (batch, T, d_model) or (batch, d_model) for single step
         h_prev: (batch, state_dim) or None  [zeros if None]
@@ -198,8 +199,8 @@ class HierarchicalTimescaleDecomposition(Module):
         return getattr(self, f"bottleneck_up_{i}")
 
     def forward(self, x: Tensor,
-                states: Optional[List[Optional[Tensor]]] = None
-                ) -> Tuple[Tensor, List[Tensor]]:
+                states: list[Tensor | None] | None = None
+                ) -> tuple[Tensor, list[Tensor]]:
         """
         x     : (batch, T, d_model)
         states: list of (batch, state_dim) h_prev per level, or None
@@ -218,7 +219,7 @@ class HierarchicalTimescaleDecomposition(Module):
         # Level i operates on x subsampled by stride 2^i
         # Fast->Slow coupling adds bottleneck_down(h_fast) to slow input
         # ----------------------------------------------------------------
-        level_inputs: List[Optional[Tensor]] = [None] * self.n_levels
+        level_inputs: list[Tensor | None] = [None] * self.n_levels
         level_inputs[0] = x  # level 0 gets full-rate input
 
         # Pre-compute subsampled inputs (before coupling; coupling added below)
@@ -257,9 +258,9 @@ class HierarchicalTimescaleDecomposition(Module):
         # For efficiency we do a single pass: process level 0 first, use its
         # hidden state to augment level 1, and so on (causal).
 
-        level_outputs: List[Optional[Tensor]] = [None] * self.n_levels
-        new_states: List[Optional[Tensor]] = [None] * self.n_levels
-        level_h_last: List[Optional[Tensor]] = [None] * self.n_levels
+        level_outputs: list[Tensor | None] = [None] * self.n_levels
+        new_states: list[Tensor | None] = [None] * self.n_levels
+        level_h_last: list[Tensor | None] = [None] * self.n_levels
 
         # Forward sweep: level 0 -> n_levels-1
         for i in range(self.n_levels):
@@ -304,7 +305,7 @@ class HierarchicalTimescaleDecomposition(Module):
         # ----------------------------------------------------------------
         # Upsample all levels to T and concatenate
         # ----------------------------------------------------------------
-        upsampled: List[Tensor] = []
+        upsampled: list[Tensor] = []
         for i in range(self.n_levels):
             yi = level_outputs[i]    # (B, T_i, D)
             T_i = yi.shape[1]

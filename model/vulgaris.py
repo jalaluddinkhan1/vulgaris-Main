@@ -18,6 +18,8 @@ from modules.htd import HierarchicalTimescaleDecomposition
 from modules.safety import SafetyPolicyHead
 from modules.icl import InContextLearning
 from modules.rmc import RegimeMixtureCore
+from memory.episodic import EpisodicMemory
+from memory.causal import CausalMemory
 from config import ModelConfig
 
 
@@ -162,28 +164,25 @@ class I2ABlend(Module):
 
 
 class OutputHead(Module):
-    """Regression or classification head."""
+    """Single-horizon regression or classification head (default, backward-compatible)."""
 
     def __init__(self, d_model: int, output_dim: int, n_classes: int = 0):
         super().__init__()
-        self.d_model = d_model
+        self.d_model    = d_model
         self.output_dim = output_dim
-        self.n_classes = n_classes
+        self.n_classes  = n_classes
         self.is_classifier = n_classes > 0
 
         out_features = n_classes if self.is_classifier else output_dim
         self.head = Linear(d_model, out_features)
 
     def forward(self, x: Tensor) -> Tensor:
-        # x: (batch, T, d_model) — pool last timestep
-        # Slice last timestep: (batch, d_model)
         last = Tensor(
             x.data[:, -1, :],
             requires_grad=x.requires_grad,
             _children=(x,),
             _op="last_timestep"
         )
-
         _x = x
 
         def _last_back():
@@ -193,11 +192,85 @@ class OutputHead(Module):
                 _x.grad = _x.grad + contrib if _x.grad is not None else contrib
 
         last._backward = _last_back
-
-        out = self.head(last)  # (batch, out_features)
-
+        out = self.head(last)
         if self.is_classifier:
             return out.softmax(axis=-1)
+        return out
+
+
+class MultiHorizonHead(Module):
+    """
+    Predicts multiple forecast horizons in a single forward pass.
+
+    Instead of pooling only the last timestep, this head mean-pools the full
+    sequence representation and projects it to H × output_dim simultaneously.
+    Each horizon gets its own Linear projection so longer horizons can learn
+    different patterns from shorter ones.
+
+    Usage
+    -----
+        head = MultiHorizonHead(d_model=256, output_dim=1, horizons=[1, 5, 20])
+        preds = head(z)   # (B, 3, 1) — predictions for t+1, t+5, t+20
+    """
+
+    def __init__(self, d_model: int, output_dim: int, horizons: list[int]):
+        super().__init__()
+        self.d_model    = d_model
+        self.output_dim = output_dim
+        self.horizons   = horizons
+        self.n_horizons = len(horizons)
+
+        # Shared pooling projection: compresses full sequence into a fixed vector
+        self.pool_proj = Linear(d_model, d_model)
+        # Per-horizon projection heads
+        for i in range(len(horizons)):
+            setattr(self, f"horizon_{i}", Linear(d_model, output_dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x : (B, T, d_model)
+        Returns (B, n_horizons, output_dim)
+        """
+        _, T, _ = x.data.shape
+
+        # Mean-pool over time → (B, d_model)
+        pool_np = x.data.mean(axis=1).astype(np.float32)
+        pool_t  = Tensor(pool_np, requires_grad=x.requires_grad,
+                         _children=(x,), _op="mh_pool")
+        _x, _T  = x, T
+
+        def _pool_back():
+            if _x.requires_grad and pool_t.grad is not None:
+                _x.grad = (_x.grad + pool_t.grad[:, None, :] / _T
+                           if _x.grad is not None
+                           else np.broadcast_to(pool_t.grad[:, None, :] / _T,
+                                                _x.data.shape).copy())
+
+        pool_t._backward = _pool_back
+
+        shared = self.pool_proj(pool_t).silu()   # (B, d_model)
+
+        # Each horizon head produces (B, output_dim)
+        horizon_outs = []
+        for i in range(self.n_horizons):
+            head = getattr(self, f"horizon_{i}")
+            horizon_outs.append(head(shared))    # (B, output_dim)
+
+        # Stack → (B, n_horizons, output_dim)
+        stacked_np = np.stack([h.data for h in horizon_outs], axis=1).astype(np.float32)
+        out = Tensor(stacked_np, requires_grad=shared.requires_grad,
+                     _children=tuple(horizon_outs), _op="mh_stack")
+        _hs = horizon_outs
+
+        def _stack_back():
+            if out.grad is None:
+                return
+            for i, h in enumerate(_hs):
+                if h.requires_grad:
+                    g = out.grad[:, i, :]
+                    h.grad = h.grad + g if h.grad is not None else g.copy()
+
+        out._backward = _stack_back
         return out
 
 
@@ -239,15 +312,24 @@ class Vulgaris(Module):
         # ── Causal attention (post-SSSR, pre-CRG) ─────────────────────────
         self.attn = CausalAttention(d_model=d_model, n_heads=max(1, d_model // 64))
 
+        # ── Unified memory (shared across modules) ────────────────────────
+        # Non-Module state — no parameters, lives outside autograd
+        _episodic = EpisodicMemory(capacity=512, d_model=d_model)
+        _causal   = CausalMemory(capacity=4096)
+        object.__setattr__(self, "episodic_memory", _episodic)
+        object.__setattr__(self, "causal_memory",   _causal)
+
         # ── In-Context Learning adapter ────────────────────────────────────
         output_or_classes = config.n_classes if config.n_classes > 0 else config.output_dim
         self.icl = InContextLearning(
             d_model=d_model,
             output_dim=output_or_classes,
             n_heads=max(1, d_model // 64),
+            episodic_memory=_episodic,   # ICL stores + retrieves across sessions
         )
 
         self.crg = CausalRoutingGraph(d_model=d_model, config=config.crg)
+        self.crg.attach_causal_memory(_causal)   # CRG writes causal edges into shared store
 
         self.hmb = HierarchicalMemoryBank(config=config.hmb)
 
@@ -274,6 +356,17 @@ class Vulgaris(Module):
             output_dim=config.output_dim,
             n_classes=config.n_classes,
         )
+        # Multi-horizon head: predicts t+1, t+5, t+20 in one shot.
+        # Disabled when n_classes > 0 (classification doesn't need horizons).
+        _horizons = getattr(config, "forecast_horizons", [1, 5, 20])
+        if config.n_classes == 0:
+            self.multi_horizon_head = MultiHorizonHead(
+                d_model=d_model,
+                output_dim=config.output_dim,
+                horizons=_horizons,
+            )
+        else:
+            object.__setattr__(self, "multi_horizon_head", None)
 
         # Optional: safety head
         self.safety = SafetyPolicyHead(
@@ -294,8 +387,27 @@ class Vulgaris(Module):
         )
 
         # ── Regime Mixture Core ───────────────────────────────────────────
-        rmc_experts = getattr(config, "rmc_n_experts", 4)
-        self.rmc = RegimeMixtureCore(d_model=d_model, n_experts=rmc_experts)
+        # RMC must run BEFORE CRG so regime weights can condition the causal graph
+        rmc_cfg = getattr(config, "rmc", None)
+        rmc_experts = rmc_cfg.n_experts if rmc_cfg is not None else 4
+        rmc_top_k   = getattr(rmc_cfg, "top_k", 0) if rmc_cfg is not None else 0
+        self.rmc = RegimeMixtureCore(
+            d_model=d_model, n_experts=rmc_experts, top_k=rmc_top_k
+        )
+        # Cache last regime weights so step() can pass them to CRG
+        object.__setattr__(self, "_last_regime_weights", None)
+
+        # ── Pre-norm layers (one per major module, applied before each call) ─
+        # Pre-LN stabilises gradients across a 9-module deep stack without
+        # adding meaningful parameter overhead.
+        self.norm_htd   = RMSNorm(d_model)
+        self.norm_sssr  = RMSNorm(d_model)
+        self.norm_attn  = RMSNorm(d_model)
+        self.norm_icl   = RMSNorm(d_model)
+        self.norm_dah   = RMSNorm(d_model)
+        self.norm_rmc   = RMSNorm(d_model)
+        self.norm_crg   = RMSNorm(d_model)
+        self.norm_hmb   = RMSNorm(d_model)
 
         # ── MAE pretraining decoder ───────────────────────────────────────
         self.mae_decoder = MAEDecoder(d_model=d_model, in_channels=config.input_dim)
@@ -566,18 +678,38 @@ class Vulgaris(Module):
         else:
             # ── Single-modality path: RevIN → ASE ────────────────────────
             x_norm = self.revin.normalize(x)   # (B, C, T) instance-normalised
+
+            # Anomaly preservation: RevIN discards per-instance mean and std,
+            # which ARE the signal for level-shift anomalies. Store them in
+            # aux so downstream anomaly detection pipelines can use them.
+            revin_mean = self.revin.last_mean if hasattr(self.revin, "last_mean") else None
+            revin_std  = self.revin.last_std  if hasattr(self.revin, "last_std")  else None
+            if revin_mean is not None:
+                aux_losses["revin_mean"] = revin_mean   # (B, C) or (B, C, 1)
+                aux_losses["revin_std"]  = revin_std
+                # Scalar anomaly score: mean of per-channel std deviation from 1.0
+                # (high std = high-energy window, possible anomaly)
+                aux_losses["anomaly_energy"] = float(np.mean(revin_std)) if revin_std is not None else 0.0
+
             z = self.ase(x_norm, timestamps, mask=mask)   # (B, T, d_model)
 
         # ── HTD ──────────────────────────────────────────────────────────
-        z_htd, _ = self.htd(z)
+        z_htd, _ = self.htd(self.norm_htd(z))
         z = z + z_htd
 
         # ── SSSR ─────────────────────────────────────────────────────────
-        z_ssm, _ = self.sssr(z)
+        dt_tensor = None
+        if timestamps is not None:
+            ts_np = timestamps.data.astype(np.float32)
+            dt_np = np.diff(ts_np, axis=1, prepend=ts_np[:, :1])
+            dt_np = np.clip(dt_np, 1e-4, 10.0)
+            dt_tensor = Tensor(dt_np, requires_grad=False)
+
+        z_ssm, _ = self.sssr(self.norm_sssr(z), dt=dt_tensor)
         z = z + z_ssm
 
         # ── Causal Attention ─────────────────────────────────────────────
-        z_attn = self.attn(z)
+        z_attn = self.attn(self.norm_attn(z))
         z = z + z_attn
 
         # ── In-Context Learning (zero-shot conditioning) ──────────────────
@@ -589,40 +721,42 @@ class Vulgaris(Module):
                 if not isinstance(y_ref, Tensor):
                     y_ref = Tensor(np.asarray(y_ref, dtype=np.float32))
                 x_ref_norm = self.revin.normalize(x_ref)
-                z_ref = self.ase(x_ref_norm)          # (B, T_ref, d_model)
+                z_ref = self.ase(x_ref_norm)
                 ctx_latents.append(z_ref)
                 ctx_labels.append(y_ref)
-            ctx_stack = self.icl.encode_context(ctx_latents, ctx_labels)
-            z_icl = self.icl(z, ctx_stack)
+            ctx_stack = self.icl.encode_context(ctx_latents, ctx_labels, retrieve_k=4)
+            z_icl = self.icl(self.norm_icl(z), ctx_stack)
             z = z + z_icl
             aux_losses["icl_active"] = True
         else:
             aux_losses["icl_active"] = False
 
-        # ── DAH: apply domain adapter as residual on SSM output ───────────
-        # skip_proj maps d_model→d_model so its adapter is shape-compatible with z
+        # ── DAH: domain adapter residual ──────────────────────────────────
         self.dah.set_domain(domain_idx)
         adapters = self.dah.get_adapters(domain_idx)
         if "skip_proj" in adapters:
             A_d, B_d = adapters["skip_proj"]
-            B_z, T_z, D_z = z.data.shape
-            z_flat = z.reshape(B_z * T_z, D_z)
+            z_dah_in = self.norm_dah(z)
+            B_z, T_z, D_z = z_dah_in.data.shape
+            z_flat = z_dah_in.reshape(B_z * T_z, D_z)
             z_adapt = self.dah._adapter_layers["skip_proj"](z_flat, A_d, B_d)
-            z_adapt = z_adapt.reshape(B_z, T_z, D_z)
-            z = z + z_adapt
+            z = z + z_adapt.reshape(B_z, T_z, D_z)
 
-        # ── CRG ──────────────────────────────────────────────────────────
-        z_crg, dag_penalty = self.crg(z)
+        # ── RMC: Regime detection — MUST run before CRG ───────────────────
+        z_rmc, rmc_balance = self.rmc(self.norm_rmc(z))
+        regime_weights_np = getattr(self.rmc, "last_regime_weights", None)
+        z = z + z_rmc
+        aux_losses["rmc_balance_loss"] = float(rmc_balance.data.sum())
+        object.__setattr__(self, "_last_regime_weights", regime_weights_np)
+        aux_losses["regime_weights"] = regime_weights_np
+
+        # ── CRG: regime-conditioned causal reasoning ──────────────────────
+        z_crg, dag_penalty = self.crg(self.norm_crg(z), regime_weights=regime_weights_np)
         z = z + z_crg
         aux_losses["dag_penalty"] = float(dag_penalty.data.sum())
 
-        # ── RMC: Regime Mixture Core ──────────────────────────────────────
-        z_rmc, rmc_balance = self.rmc(z)
-        z = z + z_rmc
-        aux_losses["rmc_balance_loss"] = float(rmc_balance.data.sum())
-
         # ── HMB ──────────────────────────────────────────────────────────
-        z_hmb, memory_loss = self.hmb(z)
+        z_hmb, memory_loss = self.hmb(self.norm_hmb(z))
         z = z + z_hmb
         aux_losses["memory_loss"] = float(memory_loss.data.sum())
 
@@ -630,6 +764,11 @@ class Vulgaris(Module):
 
         # ── Output head ──────────────────────────────────────────────────
         output = self.output_head(z)   # (batch, output_dim) or (batch, n_classes)
+
+        # Multi-horizon forecasting in one shot: (B, n_horizons, output_dim)
+        mh_head = object.__getattribute__(self, "multi_horizon_head")
+        if mh_head is not None:
+            aux_losses["multi_horizon"] = mh_head(z)
 
         # ── I2A: Imagination-to-Action blending ───────────────────────────
         # One-step imagined prediction: run last hidden state through SSSR for
@@ -663,10 +802,15 @@ class Vulgaris(Module):
         else:
             aux_losses["cbf_loss"] = 0.0
 
+        # ── SHCAL: continual adaptation consolidation ─────────────────────
+        # Monitors the SSSR layers it wraps and applies EWC/Hebbian stabilisation
+        # after each forward pass during training.
+        if self.training:
+            self.shcal.maybe_consolidate()
+
         # ── ESE: record latents for explainability (no grad) ─────────────
         h_np = z.data.copy()
         y_np = output.data.copy()
-        # Only record last timestep mean for CART to avoid memory explosion
         h_record = h_np[:, -1, :]    # (batch, d_model)
         if self.training:
             self.ese.record(h_record, y_np)
@@ -688,11 +832,13 @@ class Vulgaris(Module):
         x_t: Tensor,
         state: 'VulgarisState',
         domain_idx: int = 0,
+        dt: float | None = None,
     ) -> Tuple[Tensor, 'VulgarisState']:
         """
         Single-step streaming inference.
-        x_t: (batch, in_channels)
+        x_t : (batch, in_channels)
         state: VulgarisState
+        dt  : optional real elapsed time since last step (seconds) for adaptive timestep
         Returns (output_t, new_state)
         """
         # Add time dim for ASE: (batch, in_channels, 1)
@@ -718,13 +864,23 @@ class Vulgaris(Module):
         z_htd, new_htd_states = self.htd(z, htd_states_in)
         z = z + z_htd
 
-        # SSSR single step
+        # SSSR single step — use real elapsed time as dt when provided
         sssr_states_in = state.sssr_states if state.sssr_states else None
-        z_ssm, new_sssr_states = self.sssr(z, sssr_states_in)
+        dt_t = None
+        if dt is not None:
+            B_s = x_t.data.shape[0]
+            dt_t = Tensor(np.full((B_s,), float(dt), dtype=np.float64), requires_grad=False)
+        z_ssm, new_sssr_states = self.sssr(z, sssr_states_in, dt=dt_t)
         z = z + z_ssm
 
-        # CRG single step
-        z_crg, _ = self.crg(z)
+        # RMC — detect current regime (must precede CRG)
+        z_rmc, _ = self.rmc(z)
+        regime_weights_np = getattr(self.rmc, "last_regime_weights", None)
+        z = z + z_rmc
+        object.__setattr__(self, "_last_regime_weights", regime_weights_np)
+
+        # CRG single step — conditioned on current regime
+        z_crg, _ = self.crg(z, regime_weights=regime_weights_np)
         z = z + z_crg
 
         # HMB single step
@@ -736,7 +892,7 @@ class Vulgaris(Module):
 
         new_state = VulgarisState(
             sssr_states=new_sssr_states,
-            hmb_buffer=None,   # HMB manages its own buffer internally
+            hmb_buffer=None,
             htd_states=new_htd_states,
             step=state.step + 1,
         )

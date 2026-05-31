@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import numpy as np
 from collections import OrderedDict
-from typing import List, Optional, Tuple
 
 from engine.tensor import Tensor, Parameter, zeros, ones, cat
 from engine.module import Module
@@ -22,8 +23,10 @@ class SSSRHead(Module):
         self.hebbian_lr = hebbian_lr
         self.stability_eps = stability_eps
 
-        # log_A: init near log(0.5) + small noise so A ≈ 0.5
-        log_a_init = np.full(state_dim, np.log(0.5), dtype=np.float64)
+        # HiPPO-LegS-inspired timescale hierarchy: state 0 = long memory (slow decay),
+        # state N-1 = short memory (fast decay). Decay rates spaced log-uniformly
+        # so each state resolves a distinct temporal scale.
+        log_a_init = np.linspace(-4.0, -0.2, state_dim, dtype=np.float32)
         log_a_init += np.random.randn(state_dim) * 0.01
         self.log_A = Parameter(log_a_init, name="log_A")
 
@@ -31,7 +34,7 @@ class SSSRHead(Module):
         self.C_proj = Linear(d_model, state_dim, bias=False)
 
         # D skip-connection, one scalar per output channel (d_model)
-        self.D = Parameter(np.ones(d_model, dtype=np.float64), name="D")
+        self.D = Parameter(np.ones(d_model, dtype=np.float32), name="D")
 
         # dt projection + bias
         self.dt_proj = Linear(d_model, 1, bias=True)
@@ -39,7 +42,7 @@ class SSSRHead(Module):
         # softplus^{-1}(dt_min) = log(exp(dt_min) - 1)
         dt_init_bias = np.log(np.exp(dt_min) - 1.0 + 1e-8)
         self.dt_proj.bias.data[:] = dt_init_bias
-        self.dt_bias = Parameter(np.zeros(1, dtype=np.float64), name="dt_bias")
+        self.dt_bias = Parameter(np.zeros(1, dtype=np.float32), name="dt_bias")
 
     def _compute_dt(self, x: Tensor) -> Tensor:
         """
@@ -61,10 +64,12 @@ class SSSRHead(Module):
         sp._backward = _sp_back
         return sp.clip(self.dt_min, self.dt_max)
 
-    def forward(self, x: Tensor, h_prev: Optional[Tensor] = None
-                ) -> Tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, h_prev: Tensor | None = None,
+                dt: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """
         x    : (batch, T, d_model)
+        dt   : optional (batch, T) or (batch, T, 1) — external timestep deltas for
+               irregular-rate sensors. When None, dt is learned from x via dt_proj.
         Returns (y, h_last):
             y      : (batch, T, state_dim)  — raw SSM output, projected back externally
             h_last : (batch, state_dim)
@@ -74,7 +79,14 @@ class SSSRHead(Module):
         if h_prev is None:
             h_prev = zeros((B, self.state_dim))
 
-        dt = self._compute_dt(x)       # (B, T, 1)
+        if dt is not None:
+            # External dt: ensure shape (B, T, 1) and clamp to [dt_min, dt_max]
+            if dt.data.ndim == 2:
+                dt = Tensor(dt.data[:, :, None], requires_grad=dt.requires_grad,
+                            _children=(dt,), _op="dt_unsqueeze")
+            dt = dt.clip(self.dt_min, self.dt_max)
+        else:
+            dt = self._compute_dt(x)   # (B, T, 1)
         B_t = self.B_proj(x)           # (B, T, state_dim)
         C_t = self.C_proj(x)           # (B, T, state_dim)
 
@@ -119,7 +131,7 @@ class SSSRHead(Module):
         y = y + skip
 
         # h_last: last timestep, gradient-connected
-        h_last_np = h_np[:, -1, :].astype(np.float64)
+        h_last_np = h_np[:, -1, :].astype(np.float32)
         h_last = Tensor(h_last_np, requires_grad=h_all.requires_grad,
                         _children=(h_all,), _op="h_last_slice")
         _h_all = h_all
@@ -139,18 +151,26 @@ class SSSRHead(Module):
 
         return y, h_last
 
-    def step(self, x_t: Tensor, h_prev: Tensor) -> Tuple[Tensor, Tensor]:
+    def step(self, x_t: Tensor, h_prev: Tensor,
+             dt: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """
         Single-step inference.
         x_t   : (batch, d_model)
         h_prev: (batch, state_dim)
+        dt    : optional (batch,) or scalar — external timestep delta.
         Returns (y_t, h_new):
             y_t  : (batch, 1)
             h_new: (batch, state_dim)
         """
         x_t_3d = x_t.unsqueeze(1)                # (batch, 1, d_model)
-        dt = self._compute_dt(x_t_3d)             # (batch, 1, 1)
-        dt_2d = dt.squeeze(1)                     # (batch, 1)
+        if dt is not None:
+            dt_data = np.asarray(dt.data if isinstance(dt, Tensor) else dt,
+                                 dtype=np.float32)
+            dt_data = np.clip(dt_data.reshape(-1, 1), self.dt_min, self.dt_max)
+            dt_2d = Tensor(dt_data, requires_grad=False)
+        else:
+            dt_raw = self._compute_dt(x_t_3d)     # (batch, 1, 1)
+            dt_2d = dt_raw.squeeze(1)              # (batch, 1)
 
         B_t = self.B_proj(x_t)                    # (batch, state_dim)
         C_t = self.C_proj(x_t)                    # (batch, state_dim)
@@ -235,8 +255,63 @@ class SelectiveSSR(Module):
         # Output norm
         self.norm = RMSNorm(d_model)
 
+        # Streaming conv cache: (B, d_inner, kernel_size-1) — populated on first step()
+        self._conv_buf: np.ndarray | None = None
+
     def _get_head(self, i: int) -> SSSRHead:
         return getattr(self, f"head_{i}")
+
+    def reset_conv_cache(self) -> None:
+        """Clear the streaming causal-conv history buffer. Call between sequences."""
+        self._conv_buf = None
+
+    def _conv_step(self, u_t: Tensor) -> Tensor:
+        """
+        Single-step causal conv using a persistent ring buffer instead of
+        zero-padding. Maintains exact output as full _causal_conv for streaming.
+
+        u_t : (B, d_inner)
+        Returns (B, d_inner)
+        """
+        B, C = u_t.data.shape
+        pad = self.conv_kernel - 1
+
+        if self._conv_buf is None or self._conv_buf.shape[0] != B:
+            self._conv_buf = np.zeros((B, C, pad), dtype=np.float32)
+
+        # Build (B, C, kernel_size) window: [history | current]
+        window = np.concatenate([self._conv_buf, u_t.data[:, :, None]], axis=2)
+
+        # Roll buffer: drop oldest sample
+        self._conv_buf = window[:, :, 1:].copy()
+
+        # Wrap window as Tensor for autograd linkage
+        win_t = Tensor(window, requires_grad=u_t.requires_grad,
+                       _children=(u_t,), _op="conv_window")
+        _u_t = u_t
+
+        def _win_back():
+            if _u_t.requires_grad and win_t.grad is not None:
+                g = win_t.grad[:, :, -1:]
+                _u_t.grad = (_u_t.grad + g[:, :, 0]
+                             if _u_t.grad is not None else g[:, :, 0].copy())
+
+        win_t._backward = _win_back
+
+        # Apply depthwise conv: (B, C, kernel_size) -> (B, C, 1)
+        conv_out = self.depthwise_conv(win_t)          # (B, C, 1)
+        out_np = conv_out.data[:, :, 0]
+        out = Tensor(out_np, requires_grad=conv_out.requires_grad,
+                     _children=(conv_out,), _op="conv_step_squeeze")
+        _co = conv_out
+
+        def _sq_back():
+            if _co.requires_grad and out.grad is not None:
+                contrib = out.grad[:, :, None]
+                _co.grad = (_co.grad + contrib if _co.grad is not None else contrib.copy())
+
+        out._backward = _sq_back
+        return out  # (B, d_inner)
 
     def _causal_conv(self, u: Tensor) -> Tensor:
         """
@@ -250,7 +325,7 @@ class SelectiveSSR(Module):
 
         # Manual left padding: pad kernel_size-1 zeros on the left
         pad = self.conv_kernel - 1
-        pad_data = np.zeros((B, C, pad), dtype=np.float64)
+        pad_data = np.zeros((B, C, pad), dtype=np.float32)
         pad_t = Tensor(pad_data, requires_grad=False)
 
         # Concatenate [pad | u_t] along time axis
@@ -278,10 +353,12 @@ class SelectiveSSR(Module):
         out = conv_out.transpose((0, 2, 1))
         return out
 
-    def forward(self, x: Tensor, h_states: Optional[List] = None
-                ) -> Tuple[Tensor, List]:
+    def forward(self, x: Tensor, h_states: list | None = None,
+                dt: Tensor | None = None) -> tuple[Tensor, list]:
         """
-        x: (batch, T, d_model)
+        x  : (batch, T, d_model)
+        dt : optional (batch, T) — external per-step timestep deltas for
+             irregular-rate sensors; passed through to each SSM head.
         Returns (output, h_states_new) where output: (batch, T, d_model)
         """
         B, T, D = x.shape
@@ -347,7 +424,7 @@ class SelectiveSSR(Module):
 
             u_i._backward = _slice_back
 
-            y_i, h_new_i = head(u_i, h_states[i])   # y_i: (B, T, 1)
+            y_i, h_new_i = head(u_i, h_states[i], dt=dt)   # y_i: (B, T, 1)
             head_outs.append(y_i)
             h_states_new.append(h_new_i)
 
@@ -390,22 +467,20 @@ class SelectiveSSR(Module):
         out = self.norm(gated + skip)
         return out, h_states_new
 
-    def step(self, x_t: Tensor, h_states: List) -> Tuple[Tensor, List]:
+    def step(self, x_t: Tensor, h_states: list,
+             dt: Tensor | None = None) -> tuple[Tensor, list]:
         """
         Single-step streaming inference.
         x_t    : (batch, d_model)
         h_states: list of h_prev per head, each (batch, head_state_dim)
+        dt     : optional (batch,) — external timestep delta for this step.
         Returns (output_t, h_states_new)  output_t: (batch, d_model)
         """
-        B, D = x_t.shape
-
         # Expand
         u_t = self.x_proj(x_t)            # (B, d_inner)
 
-        # For streaming conv: we just apply with single sample (no history buffer here)
-        # Treat as T=1 with causal padding
-        u_t_3d = u_t.unsqueeze(1)                       # (B, 1, d_inner)
-        u_conv = self._causal_conv(u_t_3d).squeeze(1)   # (B, d_inner)
+        # Use the streaming conv cache — correct history vs. zero-padding
+        u_conv = self._conv_step(u_t)      # (B, d_inner)
 
         # Gating
         z_t = self.z_proj(x_t)            # (B, d_model)
@@ -432,7 +507,7 @@ class SelectiveSSR(Module):
 
             u_i._backward = _back
 
-            y_i, h_new_i = head.step(u_i, h_states[i])   # y_i: (B, 1)
+            y_i, h_new_i = head.step(u_i, h_states[i], dt=dt)   # y_i: (B, 1)
             head_outs.append(y_i)
             h_states_new.append(h_new_i)
 

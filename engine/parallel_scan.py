@@ -36,12 +36,45 @@ def _numpy_scan(a: np.ndarray, b: np.ndarray, h_init=None) -> np.ndarray:
         fb_prev = fb.copy()
         idx = np.arange(stride, T)
         src = idx - stride
-        # Composition: (fa[t], fb[t]) after stride steps starting from src
         fa[:, idx] = fa_prev[:, idx] * fa_prev[:, src]
         fb[:, idx] = fa_prev[:, idx] * fb_prev[:, src] + fb_prev[:, idx]
         stride <<= 1
 
     return fb   # fb[t] = h[t] (h_init absorbed into fb[0])
+
+
+def _numpy_scan_logspace(a: np.ndarray, b: np.ndarray, h_init=None) -> np.ndarray:
+    """
+    Log-space Hillis-Steele scan: tracks cumulative a-products in log space so
+    they never underflow to 0 on long sequences (T > 1000).
+
+    a-products are maintained as log_fa (always ≤ 0 since a ∈ (0,1]).
+    The b-accumulation uses exp(log_fa) to recover the product only when
+    needed for mixing — exp of a negative number is in (0,1], so no overflow.
+    Numerically equivalent to _numpy_scan but stable for arbitrarily long T.
+    """
+    B, T, D = a.shape
+    a_cl = np.clip(a.astype(np.float32), 1e-7, 1.0)
+    log_fa = np.log(a_cl)                            # (B, T, D) ≤ 0
+    fb = b.astype(np.float32, copy=True)
+
+    if h_init is not None:
+        fb[:, 0, :] += a_cl[:, 0, :] * h_init.astype(np.float32)
+
+    stride = 1
+    while stride < T:
+        log_fa_prev = log_fa.copy()
+        fb_prev     = fb.copy()
+        idx = np.arange(stride, T)
+        src = idx - stride
+        # Log-space product: log(a_0 … a_t) = sum of logs — never underflows
+        log_fa[:, idx] = log_fa_prev[:, idx] + log_fa_prev[:, src]
+        # Recover a-product only for the b-mixing step; exp(negative) ∈ (0,1]
+        fa_idx = np.exp(log_fa_prev[:, idx])
+        fb[:, idx] = fa_idx * fb_prev[:, src] + fb_prev[:, idx]
+        stride <<= 1
+
+    return fb
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +128,8 @@ def parallel_scan_ssm(
         return _triton_scan(a, b, h_init)
     if backend == "numba":
         return _numba_scan(a, b, h_init)
-    return _numpy_scan(a, b, h_init)
+    # Use log-space scan by default: same output, stable for T > 1000
+    return _numpy_scan_logspace(a, b, h_init)
 
 
 def parallel_scan_ssm_backward(
@@ -124,15 +158,18 @@ def parallel_scan_ssm_backward(
     grad_b : (B, T, D)
     """
     B, T, D = a.shape
-    lam = np.zeros((B, D), dtype=np.float32)  # lambda accumulator
+    # Use the same clamped a as the forward pass so gradient aligns with the
+    # actual computation; prevents lam from being multiplied by 0 (underflow).
+    a_cl = np.clip(a, 1e-7, 1.0).astype(np.float32)
+    lam = np.zeros((B, D), dtype=np.float32)
     grad_a = np.zeros_like(a)
     grad_b = np.zeros_like(a)
 
     for t in range(T - 1, -1, -1):
-        lam = lam + grad_h[:, t, :]           # accumulate upstream
+        lam = lam + grad_h[:, t, :]
         grad_b[:, t, :] = lam
         h_prev = h[:, t - 1, :] if t > 0 else np.zeros((B, D), dtype=np.float32)
         grad_a[:, t, :] = lam * h_prev
-        lam = lam * a[:, t, :]               # propagate backwards
+        lam = lam * a_cl[:, t, :]
 
     return grad_a, grad_b

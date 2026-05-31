@@ -25,12 +25,13 @@ Usage
 
     # Wire into DAH:
     dah.attach_ontology_embedding(embed, registry)
-"""
-
 from __future__ import annotations
 
+"""
+
+
 import numpy as np
-from typing import Dict, List, Optional, Set
+from typing import Dict
 
 from engine.tensor import Tensor, Parameter
 from engine.module import Module
@@ -115,23 +116,23 @@ class OntologyRegistry:
     """
 
     def __init__(self):
-        self._store: Dict[int, List[str]] = {}
+        self._store: dict[int, list[str]] = {}
 
-    def register(self, domain_idx: int, terms: List[str]) -> None:
+    def register(self, domain_idx: int, terms: list[str]) -> None:
         """Register (replace) ontology terms for a domain."""
         self._store[domain_idx] = [t.lower().strip() for t in terms]
 
-    def get(self, domain_idx: int) -> List[str]:
+    def get(self, domain_idx: int) -> list[str]:
         return self._store.get(domain_idx, [])
 
     def has_terms(self, domain_idx: int) -> bool:
         return bool(self._store.get(domain_idx))
 
-    def cluster_ids(self, domain_idx: int) -> List[int]:
+    def cluster_ids(self, domain_idx: int) -> list[int]:
         """Return cluster index for each registered term (UNK → -1)."""
         return [_ONTOLOGY_VOCAB.get(t, -1) for t in self.get(domain_idx)]
 
-    def all_domains(self) -> List[int]:
+    def all_domains(self) -> list[int]:
         return list(self._store.keys())
 
     def encode_domain_vec(self, embed: "OntologyEmbedding",
@@ -188,14 +189,14 @@ class OntologyEmbedding(Module):
 
     # ──────────────────────────────────────────────────────────────────────
 
-    def _cluster_ids_for_terms(self, terms: List[str]) -> List[int]:
+    def _cluster_ids_for_terms(self, terms: list[str]) -> list[int]:
         ids = []
         for t in terms:
             cid = _ONTOLOGY_VOCAB.get(t.lower().strip(), -1)
             ids.append(cid if cid >= 0 else self.n_clusters)   # UNK row
         return ids
 
-    def forward(self, terms: List[str]) -> Tensor:
+    def forward(self, terms: list[str]) -> Tensor:
         """
         terms: list of ontology term strings (from OntologyRegistry.get())
         Returns (1, meta_dim) Tensor.
@@ -263,7 +264,7 @@ class OntologyEmbedding(Module):
         eb = self.cluster_embed.data[id_b]
         return float(np.dot(ea, eb) / (np.linalg.norm(ea) * np.linalg.norm(eb) + 1e-8))
 
-    def nearest_terms(self, query_term: str, top_k: int = 5) -> List[tuple]:
+    def nearest_terms(self, query_term: str, top_k: int = 5) -> list[tuple]:
         """
         Return top-k nearest vocabulary terms to `query_term` by cosine similarity.
         Returns list of (term, similarity) sorted descending.

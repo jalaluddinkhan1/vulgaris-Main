@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 """Self-supervised pretraining for VULGARIS: masked reconstruction + temporal contrastive + forecasting."""
 import numpy as np
-from typing import Optional, Tuple
 
 from engine.tensor import Tensor
 from engine.layers import Linear
@@ -124,7 +125,7 @@ class SelfSupervisedTrainer:
             mask[b, idx] = True
         return mask
 
-    def masked_reconstruction_loss(self, x_np: np.ndarray) -> Tuple[float, Tensor]:
+    def masked_reconstruction_loss(self, x_np: np.ndarray) -> tuple[float, Tensor]:
         """
         x_np: (B, C, T) float32
         Returns (scalar_loss, loss_tensor)
@@ -297,7 +298,7 @@ class SelfSupervisedTrainer:
             "step": self._step,
         }
 
-    def forecast_pretrain_step(self, x_np: np.ndarray, horizon: Optional[int] = None) -> dict:
+    def forecast_pretrain_step(self, x_np: np.ndarray, horizon: int | None = None) -> dict:
         """
         Forecasting pretraining: given context [0, T-H), predict [T-H, T).
 

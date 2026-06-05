@@ -354,7 +354,9 @@ class SelectiveSSR(Module):
         return out
 
     def forward(self, x: Tensor, h_states: list | None = None,
-                dt: Tensor | None = None) -> tuple[Tensor, list]:
+                dt: Tensor | None = None,
+                domain_adapters: dict | None = None,
+                adapter_layers: dict | None = None) -> tuple[Tensor, list]:
         """
         x  : (batch, T, d_model)
         dt : optional (batch, T) — external per-step timestep deltas for
@@ -395,12 +397,19 @@ class SelectiveSSR(Module):
             soft_mask, hard_mask = differentiable_topk(scores_2d, k=k_tokens)
             route_mask = hard_mask.data   # (B, T)
 
+        # ── Helper: apply DAH adapter residual if provided ───────────────
+        def _adapt(base_out, layer_name, inp):
+            if domain_adapters and adapter_layers and layer_name in domain_adapters:
+                A, B = domain_adapters[layer_name]
+                return base_out + adapter_layers[layer_name](inp, A, B)
+            return base_out
+
         # Expansion and causal conv
-        u = self.x_proj(x)               # (B, T, d_inner)
-        u = self._causal_conv(u)          # (B, T, d_inner)
+        u = _adapt(self.x_proj(x), "x_proj", x)  # (B, T, d_inner)
+        u = self._causal_conv(u)                   # (B, T, d_inner)
 
         # Gating branch
-        z = self.z_proj(x)               # (B, T, d_model)
+        z = _adapt(self.z_proj(x), "z_proj", x)   # (B, T, d_model)
 
         # Multi-head SSM: split u into n_heads chunks along feature dim
         head_outs = []
@@ -432,7 +441,7 @@ class SelectiveSSR(Module):
         y_heads = cat(head_outs, axis=-1)   # (B, T, n_heads)
 
         # Project to d_model
-        y_ssm = self.y_proj(y_heads)        # (B, T, d_model)
+        y_ssm = _adapt(self.y_proj(y_heads), "y_proj", y_heads)  # (B, T, d_model)
 
         # Gated output: y_ssm * silu(z)
         gated = y_ssm * z.silu()            # (B, T, d_model)
@@ -462,7 +471,7 @@ class SelectiveSSR(Module):
             gated._backward = _mod_back
 
         # Skip connection
-        skip = self.skip_proj(x)            # (B, T, d_model)
+        skip = _adapt(self.skip_proj(x), "skip_proj", x)  # (B, T, d_model)
 
         out = self.norm(gated + skip)
         return out, h_states_new

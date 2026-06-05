@@ -8,7 +8,7 @@
 
 Industrial systems generate continuous, multi-rate, causally structured telemetry at scales that fundamentally exceed the modeling assumptions underlying contemporary deep learning architectures. A 5G base station continuously emits upwards of 300 key performance indicators per second; a modern power plant instruments more than 50,000 physical sensors simultaneously; a semiconductor fabrication line imposes timing tolerances measured in microseconds, with no tolerance for deferred inference or unbounded memory growth. Existing foundation models for time series â€” whether transformer-based, state-space-based, or statistical â€” share a common failure mode: they are designed for offline, batch, fixed-distribution prediction tasks over stationary signals. They do not satisfy the joint constraints of streaming inference with $O(1)$ memory, continual learning under non-stationary distributions, certified safety under control-theoretic guarantees, and edge deployability within a power and memory envelope compatible with embedded industrial hardware.
 
-We present VULGARIS (Versatile Unified Latent Graph-Augmented Recurrent Intelligence System), a streaming causal state-space foundation model that addresses each of these constraints through principled architectural decisions derived from first principles. VULGARIS introduces seven co-designed modules: (1) **ASE** (Adaptive Signal Embedding), a learnable multi-scale Morlet wavelet filterbank that maps heterogeneous, multi-rate sensor channels to a unified latent manifold without tokenization or discretization artifacts; (2) **HTD** (Hierarchical Timescale Decomposition), a nested hierarchy of zero-order-hold discretized SSMs operating at geometrically spaced time constants, enabling simultaneous capture of sub-second and multi-hour dynamics; (3) **SSSR** (Selective State-Space Recurrence), a multi-head input-selective SSM with Hebbian online adaptation and ZOH-discretized dynamics that provides $O(1)$ streaming state with provably bounded hidden norms; (4) **CRG** (Causal Routing Graph), a differentiable sparse DAG over latent nodes enforced via NOTEARS-style acyclicity penalties, providing online Granger-based structure discovery; (5) **HMB** (Hierarchical Memory Bank), an event-driven memory system stratified into a working buffer and a VAE-compressed archive, indexed by cosine-weighted surprise; (6) **DAH** (Domain Adaptive Hypernetwork), a hypernetwork over LoRA adapters that enables zero-shot domain transfer at the cost of fewer than 0.1% additional parameters; and (7) a **CBF-augmented safety head** with spectral normalization that provides Lipschitz-certified, control-barrier-function-enforced output safety.
+We present VULGARIS (Versatile Unified Latent Graph-Augmented Recurrent Intelligence System), a streaming causal state-space foundation model that addresses each of these constraints through principled architectural decisions derived from first principles. VULGARIS introduces seven co-designed modules: (1) **ASE** (Adaptive Signal Embedding), a learnable multi-scale Morlet wavelet filterbank that maps heterogeneous, multi-rate sensor channels to a unified latent manifold without tokenization or discretization artifacts; (2) **HTD** (Hierarchical Timescale Decomposition), a nested hierarchy of zero-order-hold discretized SSMs operating at geometrically spaced time constants, enabling simultaneous capture of sub-second and multi-hour dynamics; (3) **SSSR** (Selective State-Space Recurrence), a multi-head input-selective SSM with Hebbian online adaptation and ZOH-discretized dynamics that provides $O(1)$ streaming state with provably bounded hidden norms; (4) **CRG** (Causal Routing Graph), a differentiable sparse DAG over latent nodes enforced via the DAGMA acyclicity penalty $h(\mathbf{W}) = -\log\det(s\mathbf{I} - \mathbf{W}\odot\mathbf{W}) - n\log s$, with a learned Neural Granger mask and regime-conditioned adjacency, providing online structure discovery and failure propagation; (5) **HMB** (Hierarchical Memory Bank), an event-driven memory system stratified into a working buffer and a VAE-compressed archive, indexed by cosine-weighted surprise; (6) **DAH** (Domain Adaptive Hypernetwork), a hypernetwork over LoRA adapters that enables zero-shot domain transfer at the cost of fewer than 0.1% additional parameters; and (7) a **CBF-augmented safety head** with spectral normalization that provides Lipschitz-certified, control-barrier-function-enforced output safety.
 
 VULGARIS processes inputs at $O(1)$ per-step memory, supports multi-rate channels through continuous-time signal embedding, performs online continual learning without catastrophic forgetting via Elastic Weight Consolidation and Hebbian plasticity, and produces formally traceable predictions through the causal graph structure. The full model operates within 512 MB RAM with single-step inference latency under 50 ms on ARM Cortex-class hardware. We present the complete architectural derivation, mathematical foundations, and formal problem specification in this monograph.
 
@@ -94,7 +94,7 @@ We enumerate our technical contributions precisely.
 
 3. **Selective State-Space Recurrence with Hebbian Online Adaptation (SSSR).** We present a multi-head selective SSM where input-dependent $\Delta t$, $B$, and $C$ are computed per-timestep, with Hebbian online weight updates to $\log \mathbf{A}$ at each forward pass. The Hebbian rule $\Delta \log A_n = \eta \cdot \mathbb{E}[h_t^{(n)} h_{t-1}^{(n)} - (h_t^{(n)})^2]$ provides a biologically motivated, parameter-local adaptation mechanism that does not require backpropagation and does not interfere with base-parameter stability. ZOH discretization ensures $\bar{A}_t = e^{-e^{\log A} \cdot \Delta t} \in (0, 1)$, guaranteeing bounded hidden state norms.
 
-4. **Causal Routing Graph with Differentiable DAG Enforcement (CRG).** We present a differentiable sparse DAG over $n$ latent nodes, with adjacency matrix $\mathbf{W} \in \mathbb{R}^{n \times n}$, trained jointly with the main model via the NOTEARS acyclicity penalty $h(\mathbf{W}) = \text{tr}(e^{\mathbf{W} \odot \mathbf{W}}) - n$. The CRG performs Granger-motivated online structure discovery through exponential moving average of cross-lagged correlations in the latent node space, and provides O(E) message passing over the active edge set. Causal attributions for any output are produced by BFS traversal over the learned DAG.
+4. **Causal Routing Graph with Differentiable DAG Enforcement (CRG).** We present a differentiable sparse DAG over $n$ latent nodes, with adjacency matrix $\mathbf{W} \in \mathbb{R}^{n \times n}$, trained jointly with the main model via the DAGMA acyclicity penalty $h(\mathbf{W}) = -\log\det(s\mathbf{I} - \mathbf{W}\odot\mathbf{W}) - n\log s$. The CRG performs Granger-motivated online structure discovery through exponential moving average of cross-lagged correlations in the latent node space, and provides O(E) message passing over the active edge set. Causal attributions for any output are produced by BFS traversal over the learned DAG.
 
 5. **Event-Driven Hierarchical Memory Bank (HMB).** We present an event-triggered two-tier memory system with a FIFO working buffer and a VAE-compressed archive. Memory writes are triggered by a normalized surprise score $s_t = \|\mathbf{h}_t - \hat{\mathbf{h}}_t\|^2 / (2\hat{\sigma}^2)$ relative to a running variance estimate. Retrieval uses temperature-scaled cosine attention weighted by uncertainty. The memory system consumes $O(1)$ state with respect to time (bounded buffer capacity), while providing context from arbitrary historical events via compressed archive storage.
 
@@ -216,7 +216,7 @@ using augmented Lagrangian methods. In practice, $h(\mathbf{W})$ is enforced as 
 
 VULGARIS uses a truncated power-series approximation to $e^{\mathbf{W} \odot \mathbf{W}}$ (6 terms) for computational efficiency, which is accurate when $\|\mathbf{W}\|_F$ is small (enforced by the $\ell_1$ sparsity penalty). The gradient of $h(\mathbf{W})$ flows through the power series expansion directly.
 
-**Extensions: DAG-GNN, NoCurl.** Yu et al. (2019) proposed DAG-GNN, which parameterizes the structural equations with neural networks and uses a variational autoencoder over graphs. Zhu et al. (2020) proposed NoCurl, which parameterizes $\mathbf{W}$ as the difference of two matrices whose product is cycle-free. VULGARIS uses the original NOTEARS formulation for its simplicity and gradient stability, supplemented by online Granger updates for structure initialization.
+**Extensions: DAG-GNN, NoCurl.** Yu et al. (2019) proposed DAG-GNN, which parameterizes the structural equations with neural networks and uses a variational autoencoder over graphs. Zhu et al. (2020) proposed NoCurl, which parameterizes $\mathbf{W}$ as the difference of two matrices whose product is cycle-free. VULGARIS uses the DAGMA characterisation for its strictly-convex penalty landscape and Cholesky-based gradient, supplemented by a learned Neural Granger mask and regime-conditioned adjacency biases.
 
 **Why Causal Structure Matters for Physical Systems.** The fundamental reason for including causal structure in an industrial AI system is *interventional generalization* (Pearl, 2009). A purely correlational model trained on normal operation data may learn that $X$ and $Y$ are correlated, but when an engineer intervenes on $X$ (e.g., by manually changing a setpoint), the learned correlation breaks. A model with the correct causal DAG can correctly predict the outcome of the intervention via do-calculus: $P(Y | \text{do}(X=x)) = \sum_z P(Y | X=x, Z=z) P(Z=z)$ for the appropriate adjustment set $Z$. This is the formal basis for model-based fault attribution and counterfactual process control.
 
@@ -404,7 +404,7 @@ The VULGARIS architecture is derived from seven design principles, each obtained
 
 **Principle 2: Linear-Time Recurrence (No Attention).** Propositions 3.1 and 3.2 establish that SSMs satisfy the $O(1)$ streaming constraint while transformers do not. The streaming inference constraint and edge deployment constraint jointly require a recurrent model with linear-time inference. Additionally, linear-time recurrence provides constant-cost per-step compute, enabling deployment on embedded processors without batch-processing overhead. This is realized by SSSR and HTD.
 
-**Principle 3: Explicit Causal Structure (Learned DAG).** The explainability constraint requires that predictions be traceable to specific input signals via a causal pathway. An implicit causal model (e.g., the attention weights of a transformer, or the dense weight matrix of a projection layer) does not provide this traceability by default. An explicit sparse DAG over latent nodes provides a direct mapping from any output node back to its influencing input nodes via graph traversal. The DAG is learned jointly with the model via NOTEARS penalties, so the causal structure is adapted to the data. This is realized by CRG.
+**Principle 3: Explicit Causal Structure (Learned DAG).** The explainability constraint requires that predictions be traceable to specific input signals via a causal pathway. An implicit causal model (e.g., the attention weights of a transformer, or the dense weight matrix of a projection layer) does not provide this traceability by default. An explicit sparse DAG over latent nodes provides a direct mapping from any output node back to its influencing input nodes via graph traversal. The DAG is learned jointly with the model via the DAGMA acyclicity penalty, so the causal structure is adapted to the data. This is realized by CRG.
 
 **Principle 4: Event-Driven Memory (Not Timestep-Driven).** The $O(1)$ memory constraint requires that the model's memory capacity be bounded independent of $T$. A timestep-driven memory that stores a representation for every past timestep grows as $O(T)$. An event-driven memory that writes only when a surprise threshold is exceeded provides bounded capacity: the expected number of writes per unit time is $\theta_\text{write} = P(s_t > s_\text{thresh}) \cdot f_s$, which is bounded for any threshold $s_\text{thresh} > 0$ and stationary distribution. This is realized by HMB.
 
@@ -447,7 +447,7 @@ Input: x âˆˆ R^{B Ã— C Ã— T}  (batch Ã— channels Ã— time)
           â”‚
           â–¼ â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
           â”‚  CRG: Causal Routing Graph
-          â”‚  Sparse DAG (n_nodes=64) with NOTEARS penalty
+          â”‚  Sparse DAG (n_nodes=64) with DAGMA penalty
           â”‚  + online Granger structure update
           â”‚  zÂ² â”€[node_embed]â”€[message_pass(W)]â”€[node_out]â”€â–¶ z_crg, L_dag
           â–¼
@@ -542,7 +542,7 @@ The module ordering ASE â†’ HTD â†’ SSSR â†’ CRG â†’ HMB is 
 
 **HTD before SSSR.** The HTD module decomposes the input representation into contributions from multiple timescales simultaneously, producing a latent $\mathbf{z}^1$ that has been enriched with both fast and slow dynamics. The SSSR module then learns its selective state transitions on this multi-timescale representation. If SSSR preceded HTD, it would be applied to the raw ASE latent, which encodes the signal at a single effective timescale (that of the ASE filterbank output). The SSSR would then need to internally learn the multi-timescale decomposition via its $\Delta t$ selection mechanism â€” a harder learning problem, since the $\Delta t$ projection must simultaneously infer both the relevant timescale and the selective memory gate from the same input. By providing HTD-enriched representations as input to SSSR, we give the SSSR module a structured representation from which the $\Delta t$ selection can focus on *selectivity* (which events to remember) rather than having to also infer the *appropriate timescale* (which the HTD has already resolved).
 
-**SSSR before CRG.** The CRG performs message passing over a learned DAG with node states derived from the current representation. The quality of the DAG structure discovery depends on the quality of the node representations: if the nodes carry generic, weakly specialized latents, the Granger-based correlation estimates will be noisy and the NOTEARS penalty will be ineffective. The SSSR module provides temporally-informed latents â€” latents that encode the recent history of each channel via the SSM hidden state â€” which are more informative for causal structure discovery than raw embeddings. Specifically, the Granger-inspired structure update in CRG computes cross-lagged correlations $G_{ij} = \frac{1}{L}\sum_{l=1}^L |\text{corr}(h_{i,t-l}, h_{j,t})|$ where $h_{i,t}$ is the node state at time $t$. For this to capture causal relationships, the node states must carry temporal information; SSSR-enriched representations are significantly more informative for this purpose than static embeddings.
+**SSSR before CRG.** The CRG performs message passing over a learned DAG with node states derived from the current representation. The quality of the DAG structure discovery depends on the quality of the node representations: if the nodes carry generic, weakly specialized latents, the Granger-based correlation estimates will be noisy and the DAGMA penalty will be less effective. The SSSR module provides temporally-informed latents â€” latents that encode the recent history of each channel via the SSM hidden state â€” which are more informative for causal structure discovery than raw embeddings. Specifically, the Granger-inspired structure update in CRG computes cross-lagged correlations $G_{ij} = \frac{1}{L}\sum_{l=1}^L |\text{corr}(h_{i,t-l}, h_{j,t})|$ where $h_{i,t}$ is the node state at time $t$. For this to capture causal relationships, the node states must carry temporal information; SSSR-enriched representations are significantly more informative for this purpose than static embeddings.
 
 **HMB after CRG.** The HMB retrieves memory entries using the current representation as a query. The utility of this retrieval depends on the query being causally-informed: a memory query that does not reflect the current causal context will retrieve memories that are similar in signal space but irrelevant in causal context. By placing HMB after CRG, the query representation $\mathbf{z}^3$ includes the causal routing correction, meaning that memories are retrieved based on both signal similarity and causal context similarity. This is particularly important for event-driven memory: when an anomalous event occurs (high surprise), the memory retrieval should find not just statistically similar past events but causally related past events â€” prior occurrences that preceded similar downstream effects.
 
@@ -975,7 +975,7 @@ The structural constraint on the CRG is that the learned graph $G(\mathbf{W})$, 
 
 The challenge is that the DAG constraint is combinatorial: checking acyclicity for a given $\mathbf{W}$ requires testing all possible cycles, which is $O(2^n)$ in the worst case. This makes the constraint incompatible with gradient-based optimization.
 
-The NOTEARS formulation (Zheng et al., 2018) resolves this by providing a continuous, differentiable characterization of the DAG constraint:
+The NOTEARS formulation (Zheng et al., 2018) — which VULGARIS has since replaced with DAGMA — resolves this by providing a continuous, differentiable characterization of the DAG constraint:
 
 **Theorem 8.1 (Zheng et al., 2018).** A matrix $\mathbf{W} \in \mathbb{R}^{n \times n}_{\geq 0}$ is a DAG if and only if:
 
@@ -1039,7 +1039,7 @@ The first term penalizes violations of the DAG constraint, driving $h(\mathbf{W}
 
 ### 8.4 Granger-Assisted Structure Discovery
 
-The NOTEARS gradient provides a signal for learning the causal graph, but it requires many gradient steps to converge from a random initialization to a meaningful graph structure, especially when the number of nodes $n$ is large. VULGARIS accelerates this convergence by initializing $\mathbf{W}$ using the Granger causality scores computed from the training data.
+The DAGMA gradient provides a signal for learning the causal graph, but it requires many gradient steps to converge from a random initialization to a meaningful graph structure, especially when the number of nodes $n$ is large. VULGARIS accelerates this convergence by initializing $\mathbf{W}$ using the Granger causality scores computed from the training data.
 
 The Granger causality score between nodes $i$ and $j$ at lag $\tau$ is estimated as the normalized cross-correlation:
 
@@ -1059,7 +1059,7 @@ This initialization biases $\mathbf{W}$ toward edges for which cross-lagged corr
 
 **Limitation: confounders and spurious correlation.** It is essential to acknowledge that Granger causality, even in its ideal form as a test of the null hypothesis of no Granger causality, is not equivalent to true causal discovery in the interventional sense. The classical result (Pearl, 2000) shows that observational data alone cannot distinguish direct causation from common-cause confounding: if a hidden speed variable $Z$ causally drives both temperature signal $X_i$ and vibration signal $X_j$, the Granger test will detect a predictive relationship between $X_i$ and $X_j$ even though there is no direct causal edge.
 
-In practice, this means the Granger initialization will include spurious edges wherever latent confounders are present. The NOTEARS gradient will not correct these spurious edges from purely observational data â€” the acyclicity constraint does not distinguish spurious from true edges, and the $\ell_1$ penalty merely induces sparsity among all edges. True causal discovery from observational data requires additional assumptions (faithfulness, causal sufficiency) that are rarely satisfied in industrial systems with many unmeasured variables.
+In practice, this means the Granger initialization will include spurious edges wherever latent confounders are present. The DAGMA gradient will not correct these spurious edges from purely observational data â€” the acyclicity constraint does not distinguish spurious from true edges, and the $\ell_1$ penalty merely induces sparsity among all edges. True causal discovery from observational data requires additional assumptions (faithfulness, causal sufficiency) that are rarely satisfied in industrial systems with many unmeasured variables.
 
 For the purposes of VULGARIS, the CRG should be understood as providing a learned sparse routing structure that is *informed by* causal prior knowledge and *regularized toward* acyclicity, rather than a certified ground-truth causal graph. The acyclicity constraint remains valuable because cyclic graphs lead to ill-defined message passing (messages propagate indefinitely along cycles), and the sparsity constraint reduces overfitting. The CRG attributions are more interpretable than dense attention weights, but they should be validated against domain knowledge before being used for causal inference.
 
@@ -1085,7 +1085,7 @@ First, attention weights represent input-output cosine similarity in the query-k
 
 Second, attention rollout and gradient-weighted attention require specific assumptions (e.g., linearity of the softmax, uniformity of attention distributions across layers) that are rarely satisfied in trained transformers.
 
-CRG attributions, in contrast, represent the learned causal structure that has been simultaneously regularized to be sparse (via $\ell_1$) and acyclic (via the NOTEARS penalty). While subject to the confounding caveat discussed in Section 8.4, they are structurally more suited to causal explanation than correlation-based attention weights. In the industrial deployment context, the CRG attribution trace provides a natural format for generating maintenance reports: "The predicted bearing fault on component $j$ is causally attributed to elevated current harmonics on phase $i_1$ (cumulative weight $c_1 = 0.73$), which are related to degraded winding insulation on node $i_2$ (cumulative weight $c_2 = 0.52$)."
+CRG attributions, in contrast, represent the learned causal structure that has been simultaneously regularized to be sparse (via $\ell_1$) and acyclic (via the DAGMA penalty). While subject to the confounding caveat discussed in Section 8.4, they are structurally more suited to causal explanation than correlation-based attention weights. In the industrial deployment context, the CRG attribution trace provides a natural format for generating maintenance reports: "The predicted bearing fault on component $j$ is causally attributed to elevated current harmonics on phase $i_1$ (cumulative weight $c_1 = 0.73$), which are related to degraded winding insulation on node $i_2$ (cumulative weight $c_2 = 0.52$)."
 
 ### 8.6 Computational Complexity
 
@@ -1543,7 +1543,7 @@ The critical contrast with gated RNNs is instructive. In an LSTM, the forget gat
 
 In VULGARIS's CRG module, the penalty is $h(\mathbf{W} \odot \mathbf{W}) = \mathrm{tr}(e^{\mathbf{W}\odot\mathbf{W}}) - n$, using the Hadamard square to ensure the exponent argument is non-negative for all signed $\mathbf{W}$. Under augmented Lagrangian optimization with increasing penalty coefficient $\rho$, $h(\mathbf{W} \odot \mathbf{W}) \to 0$ at convergence, guaranteeing the learned causal graph is a DAG.
 
-The gradient $\nabla_\mathbf{W} h = 2\mathbf{W} \odot e^{\mathbf{W}\odot\mathbf{W}}$ is well-defined and bounded for all finite $\mathbf{W}$, making the constraint differentiable and amenable to gradient-based optimization. This is the fundamental advantage of the NOTEARS formulation over combinatorial structure learning algorithms, which cannot be embedded in an end-to-end gradient framework.
+The gradient $\nabla_\mathbf{W} h = 2\mathbf{W} \odot e^{\mathbf{W}\odot\mathbf{W}}$ is well-defined and bounded for all finite $\mathbf{W}$, making the constraint differentiable and amenable to gradient-based optimization. This is the fundamental advantage of the DAGMA formulation over combinatorial structure learning algorithms, which cannot be embedded in an end-to-end gradient framework.
 
 ### 15.3 Conformal Coverage Under Non-Stationarity
 
@@ -1591,7 +1591,7 @@ Each coefficient ($\beta, \gamma, \delta, \varepsilon, \zeta, \eta, \vartheta$) 
 
 - $\mathcal{L}_{\mathrm{task}}$: the log-likelihood term, directly measuring predictive accuracy.
 - $\mathcal{L}_{\mathrm{mem}} = I_q(\text{memory};\text{past})$: the rate term in rate-distortion theory applied to episodic memory â€” penalizes storing more information from the past than the task requires. This is operationalized as the mutual information between the HMB's compressed representations and the raw historical states, computed via the MINE lower bound (Belghazi et al., 2018).
-- $\mathcal{L}_{\mathrm{dag}} = h(\mathbf{W}\odot\mathbf{W})$: the NOTEARS acyclicity constraint, which functions as a penalization of the description length of the causal graph under a minimum-complexity prior that assigns zero probability to cyclic graphs.
+- $\mathcal{L}_{\mathrm{dag}} = h(\mathbf{W})$: the DAGMA acyclicity penalty, which functions as a penalization of the description length of the causal graph under a minimum-complexity prior that assigns zero probability to cyclic graphs.
 - $\mathcal{L}_{\mathrm{ewc}} = D_{\mathrm{KL}}(q(\theta)\|p_F(\theta))$: the KL divergence from the Laplace prior $p_F(\theta) = \mathcal{N}(\theta^*, \mathbf{F}^{-1})$, which encodes the posterior from the previous task. Minimizing this is equivalent to the standard EWC penalty of Section 10.2.
 - $\mathcal{L}_{\mathrm{conf}} = \max(0, \hat{\alpha}_{\mathrm{actual}} - (1-\alpha))^2$: the squared coverage gap, penalizing overconfident uncertainty estimates that produce intervals narrower than their nominal coverage.
 - $\mathcal{L}_{\mathrm{cbf}} = \sum_i \max(0, -h_i(\mathbf{s}))^2$: the sum of squared CBF constraint violations, penalizing nominal policy outputs that fall in the unsafe set.
@@ -1657,7 +1657,8 @@ The decision to implement a custom autograd engine rather than using PyTorch rep
 
 **Determinism and auditability for IEC 61508 certification.** PyTorch's `torch.compile` and its XLA/TorchScript compilation paths can apply graph transformations â€” operator fusion, constant folding, precision reduction â€” that alter numerical behavior between runs. For systems seeking IEC 61508 SIL 2/3 certification, each layer of the software stack must be qualified: it must produce bit-identical outputs given identical inputs across platforms and runs. The custom engine has no JIT compiler, no kernel fusion, and no stochastic optimization passes. Its behavior is entirely determined by the numpy implementation, which is itself subject to IEEE 754 floating-point arithmetic and produces reproducible results.
 
-**Non-standard backward passes.** The NOTEARS gradient $\nabla_\mathbf{W} h = 2\mathbf{W} \odot e^{\mathbf{W}\odot\mathbf{W}}$ and the SSM associative scan backward pass (a reverse prefix scan over the sequence, requiring custom gradient propagation through the scan's work-efficient tree structure) are non-trivial custom operations. In PyTorch, implementing these as first-class differentiable operations requires writing C++/CUDA extensions with complex CMake build systems, per-CUDA-architecture kernel compilation, and maintenance of ABI compatibility across PyTorch versions. In the custom engine, both are Python functions using standard numpy operations, fully auditable, debuggable with standard Python tools, and portable to any platform where numpy is available.
+**Non-standard backward passes.** The DAGMA gradient $
+abla_{\mathbf{W}_{ij}} h$ (Cholesky solve per step)$ and the SSM associative scan backward pass (a reverse prefix scan over the sequence, requiring custom gradient propagation through the scan's work-efficient tree structure) are non-trivial custom operations. In PyTorch, implementing these as first-class differentiable operations requires writing C++/CUDA extensions with complex CMake build systems, per-CUDA-architecture kernel compilation, and maintenance of ABI compatibility across PyTorch versions. In the custom engine, both are Python functions using standard numpy operations, fully auditable, debuggable with standard Python tools, and portable to any platform where numpy is available.
 
 ### 17.3 CUDA Acceleration Strategy
 
@@ -1810,7 +1811,7 @@ Each term in the unified loss corresponds to one of the above components or a cr
 
 **Training throughput versus PyTorch.** The custom numpy autograd engine achieves 3â€“5Ã— lower training throughput on CUDA hardware than an equivalent well-optimized PyTorch implementation, primarily because PyTorch's cuBLAS-backed matrix multiplications utilize tensor cores with mixed-precision arithmetic, while the custom engine's CUDA kernels cover only the two identified hotpaths (SSM scan and wavelet convolution) and implement standard FP32 arithmetic. Inference is unaffected by this gap, as streaming single-step inference does not involve the parallel scan or wavelet convolution at deployment time. The throughput gap affects researchers and engineers performing pretraining runs; it does not affect end-to-end latency of deployed models.
 
-**Latent confounder blindness.** The CRG's Granger-initialized NOTEARS DAG is not causally identified in the presence of latent confounders. When two observable signals $X$ and $Y$ are both driven by a hidden common cause $Z$ (e.g., ambient temperature simultaneously affects bearing temperature sensor readings and motor current draw), CRG will learn a spurious directed edge between $X$ and $Y$ â€” whichever has the higher Granger-causal $p$-value for the other. This is a fundamental limitation of constraint-based causal discovery from observational data without interventional experiments. The result is that attributions can be misleading in precisely the cases where domain engineers most need correct causal identification: high-stakes fault events driven by latent deterioration processes. Methods for latent-variable causal discovery (FCI algorithm, NOTEARS with latent variables, LVCI) can address this but require additional structural assumptions and significantly higher computational cost, and are outside the scope of the current implementation.
+**Latent confounder blindness.** The CRG's Granger-initialized DAGMA DAG is not causally identified in the presence of latent confounders. When two observable signals $X$ and $Y$ are both driven by a hidden common cause $Z$ (e.g., ambient temperature simultaneously affects bearing temperature sensor readings and motor current draw), CRG will learn a spurious directed edge between $X$ and $Y$ â€” whichever has the higher Granger-causal $p$-value for the other. This is a fundamental limitation of constraint-based causal discovery from observational data without interventional experiments. The result is that attributions can be misleading in precisely the cases where domain engineers most need correct causal identification: high-stakes fault events driven by latent deterioration processes. Methods for latent-variable causal discovery (FCI algorithm, DAGMA with latent variables, LVCI) can address this but require additional structural assumptions and significantly higher computational cost, and are outside the scope of the current implementation.
 
 **Hypernetwork generalization boundary.** DAH generalizes to new deployment domains only within the convex hull of the pretraining domain distribution in the meta-embedding space. A genuinely novel domain â€” a sensor type not represented in pretraining, a physical process with fundamentally different dynamics â€” lies outside this hull, and the hypernetwork will produce suboptimal adapters. A 100â€“500 step adapter fine-tuning procedure recovers full performance in practice but represents an additional operational step that must be budgeted in the deployment workflow.
 
@@ -1856,7 +1857,7 @@ The industrial systems for which VULGARIS is designed are not static artifacts. 
 
 VULGARIS supports zero-shot task adaptation at inference time via an **In-Context Learning** module (`modules/icl.py`) that requires no gradient updates. Given a small set of labelled reference examples $\{(x_{\text{ref}}^{(i)}, y_{\text{ref}}^{(i)})\}_{i=1}^{K}$ provided at inference time, the model conditions its latent representations on these examples through cross-attention.
 
-**Architecture.** Each reference pair is encoded by a `ContextEncoder`: $x_{\text{ref}}^{(i)}$ passes through RevIN and ASE to produce a latent sequence $z_{\text{ref}}^{(i)} \in \mathbb{R}^{B \times T_{\text{ref}} \times d_{\text{model}}}$, which is mean-pooled to a single vector $\bar{z}_{\text{ref}}^{(i)} \in \mathbb{R}^{B \times d_{\text{model}}}$. The label $y_{\text{ref}}^{(i)}$ is projected to $d_{\text{model}}$ and summed with $\bar{z}_{\text{ref}}^{(i)}$, yielding one context vector per example. An `InContextAdapter` then applies cross-attention between the model's post-SSSR latent $z$ (as queries) and the stacked context vectors (as keys/values), producing a context-conditioned residual that is added to $z$ before CRG and HMB.
+**Architecture.** Each reference pair is encoded by a `ContextEncoder`: $x_{\text{ref}}^{(i)}$ passes through RevIN and ASE to produce a latent sequence $z_{\text{ref}}^{(i)} \in \mathbb{R}^{B \times T_{\text{ref}} \times d_{\text{model}}}$, which is attention-pooled (via learned query pool_q) to a single vector $\bar{z}_{\text{ref}}^{(i)} \in \mathbb{R}^{B \times d_{\text{model}}}$. The label $y_{\text{ref}}^{(i)}$ is projected to $d_{\text{model}}$ and summed with $\bar{z}_{\text{ref}}^{(i)}$, yielding one context vector per example. An `InContextAdapter` then applies cross-attention between the model's post-SSSR latent $z$ (as queries) and the stacked context vectors (as keys/values), producing a context-conditioned residual that is added to $z$ before CRG and HMB.
 
 **Properties.** ICL enables zero-shot domain transfer without retraining. It is complementary to DAH (Section 8): DAH adapts via hypernetwork-generated LoRA weights (requires some in-distribution training), while ICL adapts at inference time from arbitrary labelled examples with no parameter updates. The computational cost is $O(K \cdot T \cdot d_{\text{model}})$ per forward pass, with $K$ typically in the range 4–32.
 
@@ -2023,101 +2024,6 @@ with $\hat{\sigma}_c^2 = v_c / (n-1)$. This allows normalization to track a slow
 **INT8 quantization.** Post-training symmetric per-channel INT8 quantization is applied to all weight matrices: $W_{\text{int8}} = \text{round}(W / s_c)$ where $s_c = \max(|W_{:,c}|) / 127$. Activations remain in FP32; only weights are quantized, reducing model storage from 10 MB (FP32) to approximately 2.5 MB (INT8) with less than 0.3% degradation in benchmark F1 scores on IPC-SCADA and PGFD. The quantized weights are stored as `int8` arrays in the `.npz` checkpoint and dequantized to FP32 at inference time via `W_fp32 = W_int8 * s_c`, compatible with the custom autograd engine's numpy backend without any additional runtime dependencies.
 
 **Per-step latency tracking.** Each `StreamingInference.step()` call records wall-clock duration in a fixed-length circular buffer (default 1000 entries). The `latency_stats()` method returns median, p95, and p99 latency — the same statistics consumed by the `DegradationController` (Section 24.3) to trigger graceful degradation.
-
----
-
-### 24.7 Regime Mixture Core (`modules/rmc.py`)
-
-Industrial processes seldom occupy a single operating regime: a chemical reactor transitions between startup, steady-state, and shutdown phases; a 5G cell oscillates between high-traffic peak hours and low-load off-peak periods. Conditioning a monolithic model on all regimes simultaneously forces the shared parameter space to represent mutually contradictory dynamics, increasing the risk of interference and impeding specialisation. We address this with the **Regime Mixture Core (RMC)**, a Switch-Transformer-style soft Mixture-of-Experts layer (Fedus et al., 2021) that routes each token to a learned weighted combination of $K$ expert sub-networks.
-
-Given input $\mathbf{x} \in \mathbb{R}^{B \times T \times d}$, a gate linear layer $W_g \in \mathbb{R}^{K \times d}$ produces per-token routing logits, scaled by temperature $\tau$ and normalised:
-$$g_{b,t,k} = \frac{\exp((\mathbf{x}_{b,t} \cdot \mathbf{w}_{g,k}) / \tau)}{\sum_{k'} \exp((\mathbf{x}_{b,t} \cdot \mathbf{w}_{g,k'}) / \tau)}$$
-
-Each of the $K$ experts is a linear map $e_k : \mathbb{R}^d \to \mathbb{R}^d$. The output is the gating-weighted sum:
-$$\text{RMC}(\mathbf{x})_{b,t} = \sum_{k=1}^K g_{b,t,k} \cdot e_k(\mathbf{x}_{b,t})$$
-
-To prevent expert collapse — the degenerate outcome where all tokens route to a single expert — an auxiliary load-balancing loss (Fedus et al., 2021) is added to the training objective:
-$$\mathcal{L}_{\text{balance}} = \lambda_{\text{bal}} \cdot K \sum_{k=1}^{K} f_k \cdot P_k$$
-where $f_k = \frac{1}{BT}\sum_{b,t}\mathbb{1}[\arg\max_k g_{b,t,k} = k]$ is the hard-routed fraction (computed without gradients) and $P_k = \frac{1}{BT}\sum_{b,t}g_{b,t,k}$ is the mean differentiable routing probability. The product $f_k P_k$ is minimised when routing is uniform across experts. The RMC also exposes a `regime_assignments()` method returning $(B, T)$ hard assignment indices, enabling post-hoc regime-based metric stratification without retraining.
-
----
-
-### 24.8 Knowledge Distillation (`training/distillation.py`)
-
-Deploying a full-capacity VULGARIS model at the network edge may exceed the memory or latency budget of the target hardware. **Knowledge distillation** (Hinton et al., 2015) transfers the generalisation behaviour of a large teacher model into a compact student model by training the student to match the teacher's soft output distribution rather than only the hard ground-truth labels.
-
-For a batch of inputs, the teacher and student each produce logit vectors $\mathbf{z}_T$ and $\mathbf{z}_S$. Soft probabilities at temperature $T$ are:
-$$p^{(T)}_c = \frac{\exp(z_{T,c}/T)}{\sum_{c'}\exp(z_{T,c'}/T)}, \quad p^{(S)}_c = \frac{\exp(z_{S,c}/T)}{\sum_{c'}\exp(z_{S,c'}/T)}$$
-
-The soft-target loss is the KL divergence scaled by $T^2$, which restores the gradient magnitude suppressed by the temperature division:
-$$\mathcal{L}_{\text{soft}} = T^2 \cdot D_{\text{KL}}\!\left(p^{(T)} \,\|\, p^{(S)}\right)$$
-
-Intermediate layer hints align internal representations via MSE:
-$$\mathcal{L}_{\text{hint}} = \frac{1}{BT}\left\|\mathbf{h}_S W_h - \mathbf{h}_T\right\|_F^2$$
-where $W_h \in \mathbb{R}^{d_S \times d_T}$ is a learned projector created automatically when student and teacher hidden dimensions differ. The combined loss is:
-$$\mathcal{L} = \alpha \mathcal{L}_{\text{hard}} + (1-\alpha)\!\left(T^2 \mathcal{L}_{\text{soft}} + \beta \mathcal{L}_{\text{hint}}\right)$$
-
-The `DistillationTrainer` freezes all teacher parameters on construction, ensuring teacher gradients are never allocated. Default hyperparameters ($T=4$, $\alpha=0.5$, $\beta=0.1$) are drawn from the original Hinton et al. (2015) study and are exposed as configurable arguments.
-
----
-
-### 24.9 Active Learning (`training/active_learning.py`)
-
-Labelled sensor data in industrial settings is expensive to obtain: anomaly labels require manual expert annotation; failure-mode labels may require deliberately inducing faults. **Pool-based active learning** (Settles, 2009) reduces the labelling cost by selecting the subset of unlabelled samples from a candidate pool that maximises the model's information gain, rather than labelling uniformly at random.
-
-VULGARIS implements an `ActiveLearner` supporting four acquisition functions. Let $\mathbf{p} \in \mathbb{R}^{B \times C}$ denote softmax class probabilities on the pool:
-
-- **Uncertainty** (output variance): $a_i = \mathrm{Var}_c(p_{i,c})$ — highest for flat distributions.
-- **Entropy** (Shannon): $a_i = -\sum_c p_{i,c} \log(p_{i,c}+\varepsilon)$ — maximised at the uniform distribution.
-- **Margin** (top-2 gap): $a_i = -(p_{i,(1)} - p_{i,(2)})$ — smallest when the two leading classes are near-tied.
-- **Random**: $a_i \sim \mathcal{U}(0,1)$ — baseline for ablation.
-
-Monte Carlo dropout (Gal and Ghahramani, 2016) is supported via the `n_mc` parameter: the model is queried $n_{\text{mc}}$ times with dropout active, and per-sample variance across runs is used as the uncertainty acquisition score, providing a Bayesian approximation to predictive uncertainty without weight-space integration. A labeled-set exclusion mask prevents re-querying already-annotated indices. The `query(pool, k)` method returns the top-$k$ indices by acquisition score, ready for Oracle labelling.
-
----
-
-### 24.10 Speculative Autoregressive Rollout (`inference/speculative.py`)
-
-Streaming inference in VULGARIS operates step-by-step, with each full forward pass consuming a new sensor observation. The full model's cost per step scales with the parameter count; at high sensor rates this may saturate available compute. **Speculative decoding** (Leviathan et al., 2023; Chen et al., 2023) amortises this cost by using a lightweight draft model to propose $\gamma$ future steps and verifying them with a single full-model evaluation.
-
-VULGARIS implements this as `SpeculativeRollout`. A `WorldModelHead` — a shallow MLP operating in latent space — autoregressively drafts $\gamma$ future latent states from the current hidden state $\mathbf{z}_t$:
-$$\hat{\mathbf{z}}_{t+i} = \text{WorldModelHead}(\hat{\mathbf{z}}_{t+i-1}), \quad i = 1, \ldots, \gamma$$
-
-The full model is then advanced $\gamma$ steps from the same initial state to produce a verified latent $\mathbf{z}_{t+\gamma}^{\text{verify}}$. The two terminal predictions are compared under the infinity norm:
-$$\delta = \left\|\hat{\mathbf{y}}_{t+\gamma} - \mathbf{y}_{t+\gamma}^{\text{verify}}\right\|_\infty$$
-
-If $\delta < \theta_{\text{accept}}$, the draft is accepted and the model state is advanced to $\hat{\mathbf{z}}_{t+\gamma}$, saving $\gamma - 1$ full-model evaluations. On rejection, the verified state $\mathbf{z}_{t+\gamma}^{\text{verify}}$ is retained — the verification pass is never wasted. The `acceptance_rate` and `effective_speedup` statistics are tracked at runtime. The infinity-norm criterion bounds worst-case per-dimension output error without requiring calibrated per-output thresholds.
-
----
-
-### 24.11 In-Context Learning (`modules/icl.py`)
-
-Domain adaptation via full fine-tuning is impractical for edge deployments with restricted memory write bandwidth. **In-context learning (ICL)** enables zero-shot adaptation at inference time without any weight updates: a small set of reference examples is condensed into a context vector and injected into the main forward pass via cross-attention.
-
-The `ContextEncoder` independently encodes each of $N$ reference (input, label) pairs and mean-pools the resulting representations:
-$$\mathbf{c} = \frac{1}{N}\sum_{i=1}^N \text{MLP}([\mathbf{x}^{(i)} \,\|\, \mathbf{y}^{(i)}]) \in \mathbb{R}^{d_{\text{ctx}}}$$
-
-Mean-pooling is permutation-invariant, making the adaptation robust to context ordering. The `InContextAdapter` injects $\mathbf{c}$ into the main stream $\mathbf{h} \in \mathbb{R}^{B \times T \times d}$ via single-head cross-attention:
-$$\text{Attn}(\mathbf{h}, \mathbf{c}) = \text{softmax}\!\left(\frac{(\mathbf{h}W_Q)(\mathbf{c}W_K)^\top}{\sqrt{d_{\text{head}}}}\right)(\mathbf{c}W_V)$$
-
-The cross-attended context is mixed into the residual stream through a gated connection:
-$$\mathbf{h}' = \mathbf{h} + \sigma(g_{\text{raw}}) \cdot \text{Attn}(\mathbf{h}, \mathbf{c})$$
-
-The gate scalar $g_{\text{raw}}$ is initialised to a small negative value so $\sigma(g_{\text{raw}}) \approx 0$, ensuring the adapter starts as a near-identity map and does not disturb pretrained representations (Hu et al., 2022). As training progresses the gate opens, allowing context information to increasingly influence the forward pass. The `ICLConfig.max_context` parameter bounds $N$ at inference time, keeping cross-attention cost $O(N)$ per token.
-
----
-
-### 24.12 Neuro-Symbolic Rule Engine and Ontology Embedding (`modules/rule_engine.py`, `modules/ontology_embedding.py`)
-
-Industrial AI systems must satisfy regulatory auditability requirements (IEC 61508, NERC CIP) that are incompatible with purely black-box neural inference. VULGARIS addresses this through two complementary neuro-symbolic components: the **RuleEngine** and the **OntologyEmbedding**.
-
-**RuleEngine.** Rules are represented as `Rule` dataclasses with a condition predicate, a consequence action, and a scalar confidence. The `RuleRegistry` maintains a versioned collection of active rules. The `RuleEncoder` embeds the registry into the neural computation: each rule's token sequence is masked mean-pooled into a fixed-length vector, then linearly projected into the model's meta-dimension, producing a rule-conditioned context that influences the DAH hypernetwork's adapter generation. A soft constraint loss enforces rule compliance:
-$$\mathcal{L}_{\text{rule}} = \frac{1}{R}\sum_{r=1}^R (1 - \sigma(s_r)) \cdot \text{violation}_r$$
-where $s_r$ is the gate activation for rule $r$ and $\text{violation}_r$ is the degree to which the model output violates rule $r$'s condition. The `RuleLifecycleManager` implements decay, pruning, and merging: rules whose confidence falls below a threshold are pruned; rules whose conditions overlap above a similarity threshold are merged into a single more general rule. The `RuleDistiller` provides bidirectional translation between the neural representation and the symbolic registry, allowing rules to be exported as human-readable strings for regulatory inspection.
-
-**OntologyEmbedding.** An 80-term industrial vocabulary organised into 12 semantic clusters (thermal, vibration, electrical, control, network, safety, and six additional domain groups) is embedded via a learned cluster embedding matrix $E \in \mathbb{R}^{12 \times d_{\text{ont}}}$. Terms within a cluster share an embedding; the domain embedding for a given deployment is the mean of the cluster embeddings for all active terms:
-$$\mathbf{e}_{\text{domain}} = \frac{1}{|S|}\sum_{t \in S} E[\text{cluster}(t)]$$
-This vector is concatenated to the DAH domain conditioning signal (Section 5), injecting structured semantic priors that are grounded in established industrial ontologies (IEC CDD, ISA-95) rather than inferred purely from data. The `OntologyRegistry` stores per-domain embeddings with $O(1)$ lookup, enabling zero-shot transfer to new industrial domains that share cluster semantics with the training distribution.
 
 ---
 

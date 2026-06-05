@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import TYPE_CHECKING
 import numpy as np
 
 from engine.tensor import Tensor, Parameter, zeros, ones, randn
 from engine.module import Module
 from engine.layers import Linear, Embedding
 from config import DAHConfig
+
+if TYPE_CHECKING:
+    from modules.rule_engine        import RuleRegistry, RuleEncoder
+    from modules.ontology_embedding import OntologyEmbedding, OntologyRegistry
 
 
 class AdapterLayer(Module):
@@ -268,7 +273,11 @@ class DomainAdaptiveHypernetwork(Module):
 
         return result
 
-    def attach_ontology_embedding(self, embed, registry) -> None:
+    def attach_ontology_embedding(
+        self,
+        embed: "OntologyEmbedding",
+        registry: "OntologyRegistry",
+    ) -> None:
         """
         Wire an OntologyEmbedding + OntologyRegistry into DAH.
 
@@ -285,7 +294,11 @@ class DomainAdaptiveHypernetwork(Module):
         object.__setattr__(self, "_onto_registry", registry)
         self.clear_cache()
 
-    def attach_rule_encoder(self, encoder, registry) -> None:
+    def attach_rule_encoder(
+        self,
+        encoder: "RuleEncoder",
+        registry: "RuleRegistry",
+    ) -> None:
         """
         Wire a RuleEncoder + RuleRegistry into DAH.
 

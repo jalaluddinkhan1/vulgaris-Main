@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # ─────────────────────────────────────────────────────────────────────────────
 [project]
 name        = "vulgaris"
-version     = "0.7.0"
+version     = "0.8.0"
 description = "Foundational industrial AI model for real-time telemetry, IoT, and time-series"
 readme      = "README.md"
 license     = "Apache-2.0"
@@ -48,6 +48,12 @@ serve = [
 train = [
     "tqdm>=4.66",
     "rich>=13.6",
+]
+export = [
+    "torch>=2.1",
+    "onnx>=1.15",
+    "onnxruntime>=1.16",
+    "onnxsim>=0.4",
 ]
 dev = [
     "pytest>=7.4",

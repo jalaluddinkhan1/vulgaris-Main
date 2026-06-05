@@ -20,7 +20,7 @@ Install extras
 
 from __future__ import annotations
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 __author__  = "VULGARIS Contributors"
 __license__ = "Apache-2.0"
 
@@ -60,19 +60,28 @@ from serve.migration   import migrate_checkpoint, HotSwapAdapter, get_checkpoint
 
 # ── Modules (importable individually) ────────────────────────────────────────
 from modules.ase              import AdaptiveSignalEmbedding
-from modules.sssr             import SelectiveSSR
-from modules.htd              import HierarchicalTimescaleDecomposition
+from modules.revin            import RevIN
+from modules.sssr             import SelectiveSSR, SSSRHead
+from modules.htd              import HierarchicalTimescaleDecomposition, HTDLevel
 from modules.crg              import CausalRoutingGraph
-from modules.hmb              import HierarchicalMemoryBank
-from modules.dah              import DomainAdaptiveHypernetwork
-from modules.ese              import ExplainabilityEngine
-from modules.safety           import SafetyPolicyHead
+from modules.hmb              import HierarchicalMemoryBank, MemoryVAE
+# modules.episodic_memory / causal_memory are thin re-exports of memory.*
+# already imported below via memory.episodic and memory.causal
+from modules.dah              import DomainAdaptiveHypernetwork, AdapterLayer
+from modules.ese              import ExplainabilityEngine, CARTExtractor, DecisionNode
+from modules.safety           import SafetyPolicyHead, CBFLayer, SpectralNormLinear
 from modules.shcal            import SHCAL
-from modules.cmla             import CrossModalLatentAlignment
-from modules.icl              import InContextLearning
+from modules.cmla             import CrossModalLatentAlignment, ModalityEncoder
+from modules.icl              import InContextLearning, InContextAdapter, ContextEncoder
 from modules.rmc              import RegimeMixtureCore
+from modules.ttt              import TestTimeTrainer, TTTConfig
+from modules.event_encoder    import EventEncoder
+from modules.weibull_head     import WeibullHead
+from modules.multitask_head   import MultiTaskHead
 from modules.ontology_embedding import OntologyEmbedding, OntologyRegistry
-from modules.rule_engine      import RuleRegistry, RuleEncoder, Rule
+from modules.rule_engine      import (RuleRegistry, RuleEncoder, Rule,
+                                      RuleConditionLoss, RuleDistiller,
+                                      RuleLifecycleManager)
 
 # ── Preprocessing ─────────────────────────────────────────────────────────────
 from preprocessing.industrial_tokenizer import (
@@ -138,12 +147,25 @@ __all__ = [
     "broadcast_parameters", "allreduce_gradients", "allreduce_scalar",
     "DistributedSampler",
 
-    # Modules
-    "AdaptiveSignalEmbedding", "SelectiveSSR", "HierarchicalTimescaleDecomposition",
-    "CausalRoutingGraph", "HierarchicalMemoryBank", "DomainAdaptiveHypernetwork",
-    "ExplainabilityEngine", "SafetyPolicyHead", "SHCAL", "CrossModalLatentAlignment",
-    "InContextLearning", "RegimeMixtureCore", "OntologyEmbedding", "OntologyRegistry",
+    # Modules — top-level classes
+    "AdaptiveSignalEmbedding", "RevIN",
+    "SelectiveSSR", "SSSRHead",
+    "HierarchicalTimescaleDecomposition", "HTDLevel",
+    "CausalRoutingGraph",
+    "HierarchicalMemoryBank", "MemoryVAE",
+    "DomainAdaptiveHypernetwork", "AdapterLayer",
+    "ExplainabilityEngine", "CARTExtractor", "DecisionNode",
+    "CrossModalLatentAlignment", "ModalityEncoder",
+    "SafetyPolicyHead", "CBFLayer", "SpectralNormLinear",
+    "MultiTaskHead",
+    "SHCAL",
+    "InContextLearning", "InContextAdapter", "ContextEncoder",
+    "RegimeMixtureCore",
+    "TestTimeTrainer", "TTTConfig",
+    "EventEncoder", "WeibullHead",
+    "OntologyEmbedding", "OntologyRegistry",
     "Rule", "RuleRegistry", "RuleEncoder",
+    "RuleConditionLoss", "RuleDistiller", "RuleLifecycleManager",
 
     # Preprocessing
     "IndustrialTokenizer", "ChannelSpec", "TokenType", "LogEncoder",

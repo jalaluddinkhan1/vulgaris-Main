@@ -231,7 +231,7 @@ class RegimeMixtureCore(Module):
         # need to re-run gate_proj to extract regime context.
         regime_weights = weights_np_full.mean(axis=0).astype(np.float32)   # (K,)
         self.last_regime_weights = regime_weights
-        return z_out, balance_loss
+        return z_out, balance_loss, regime_weights
 
     def regime_assignments(self, z: Tensor) -> np.ndarray:
         """

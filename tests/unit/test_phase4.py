@@ -44,31 +44,31 @@ class TestRegimeMixtureCore(unittest.TestCase):
     def test_output_shape(self):
         rmc = self.RMC(d_model=32, n_experts=4)
         z = Tensor(np.random.randn(2, 8, 32).astype(np.float64))
-        z_out, balance = rmc(z)
+        z_out, balance, _ = rmc(z)
         self.assertEqual(z_out.data.shape, (2, 8, 32))
 
     def test_balance_loss_scalar(self):
         rmc = self.RMC(d_model=32, n_experts=4)
         z = Tensor(np.random.randn(2, 8, 32).astype(np.float64))
-        _, balance = rmc(z)
+        _, balance, _ = rmc(z)
         self.assertEqual(balance.data.shape, (1, 1))
 
     def test_balance_loss_nonnegative(self):
         rmc = self.RMC(d_model=32, n_experts=4)
         z = Tensor(np.random.randn(2, 8, 32).astype(np.float64))
-        _, balance = rmc(z)
+        _, balance, _ = rmc(z)
         self.assertGreaterEqual(float(balance.data.sum()), 0.0)
 
     def test_balance_loss_finite(self):
         rmc = self.RMC(d_model=32, n_experts=4)
         z = Tensor(np.random.randn(2, 8, 32).astype(np.float64))
-        _, balance = rmc(z)
+        _, balance, _ = rmc(z)
         self.assertTrue(np.isfinite(balance.data).all())
 
     def test_backward_runs(self):
         rmc = self.RMC(d_model=16, n_experts=2)
         z = Tensor(np.random.randn(2, 4, 16).astype(np.float64), requires_grad=True)
-        z_out, balance = rmc(z)
+        z_out, balance, _ = rmc(z)
         # Propagate gradient through the mixture output (not just balance)
         z_out.backward(np.ones_like(z_out.data))
         # gate_proj should have gradients from the mixture computation
@@ -77,7 +77,7 @@ class TestRegimeMixtureCore(unittest.TestCase):
     def test_n_experts_configurable(self):
         rmc = self.RMC(d_model=16, n_experts=6)
         z = Tensor(np.random.randn(1, 4, 16).astype(np.float64))
-        z_out, _ = rmc(z)
+        z_out, _, _ = rmc(z)
         self.assertEqual(z_out.data.shape, (1, 4, 16))
 
     def test_regime_assignments_shape(self):

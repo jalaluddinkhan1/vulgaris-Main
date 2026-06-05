@@ -81,11 +81,10 @@ class WorldModelHead(Module):
         for _ in range(k):
             h_next = self.trans(h).tanh()   # (B, d_model)
             u_raw  = self.unc(h_next)       # (B, 1)
-            unc    = float(np.mean(
-                np.log1p(np.exp(np.clip(u_raw.data, -20, 20)))
-            ))
+            # softplus per sample — keep (B,) not collapsed to a scalar
+            unc_b  = np.log1p(np.exp(np.clip(u_raw.data[:, 0], -20, 20)))  # (B,)
             steps_z.append(h_next)
-            steps_unc.append(unc)
+            steps_unc.append(unc_b)
             h = h_next
 
         # Stack into (B, k, d_model)
@@ -108,7 +107,7 @@ class WorldModelHead(Module):
 
         future_z._backward = _stack_back
 
-        uncertainties = np.array(steps_unc)   # (k,) — scalar per step
+        uncertainties = np.stack(steps_unc, axis=1)  # (B, k) — per-sample per-step
         return future_z, uncertainties
 
 
@@ -390,7 +389,7 @@ class Vulgaris(Module):
         # RMC must run BEFORE CRG so regime weights can condition the causal graph
         rmc_cfg = getattr(config, "rmc", None)
         rmc_experts = rmc_cfg.n_experts if rmc_cfg is not None else 4
-        rmc_top_k   = getattr(rmc_cfg, "top_k", 0) if rmc_cfg is not None else 0
+        rmc_top_k   = rmc_cfg.top_k if rmc_cfg is not None else 0
         self.rmc = RegimeMixtureCore(
             d_model=d_model, n_experts=rmc_experts, top_k=rmc_top_k
         )
@@ -424,9 +423,83 @@ class Vulgaris(Module):
         object.__setattr__(self, "_n_modalities", 1)
         object.__setattr__(self, "_current_domain", 0)
 
+        # TTT — disabled by default; enabled via model.enable_ttt()
+        # _ttt_lock prevents two concurrent requests from both entering the
+        # inner loop simultaneously and running concurrent gradient updates.
+        import threading as _threading
+        object.__setattr__(self, "_ttt", None)
+        object.__setattr__(self, "_ttt_active", False)
+        object.__setattr__(self, "_ttt_lock", _threading.Lock())
+
     # ──────────────────────────────────────────────────────────────────────
     # Multi-modal initialisation (called externally when needed)
     # ──────────────────────────────────────────────────────────────────────
+
+    def export_onnx(
+        self,
+        path: str = "vulgaris.onnx",
+        batch_size: int = 1,
+        opset: int = 17,
+        simplify: bool = False,
+        verbose: bool = True,
+    ) -> str:
+        """
+        Export this model's streaming inference path to ONNX.
+
+        Does NOT require any changes to this file — the export bridge lives in
+        serve/onnx_export.py and only needs PyTorch at export time, not at
+        runtime.
+
+        Parameters
+        ----------
+        path       : output .onnx file path
+        batch_size : static batch size (0 = dynamic)
+        opset      : ONNX opset version (default 17)
+        simplify   : run onnx-simplifier (requires pip install onnxsim)
+        verbose    : print export summary
+
+        Returns
+        -------
+        str — path to written .onnx file
+
+        Example
+        -------
+            model.export_onnx("edge/vulgaris.onnx")
+            model.export_onnx("edge/vulgaris.onnx", batch_size=0)  # dynamic batch
+        """
+        from serve.onnx_export import export_onnx
+        return export_onnx(self, path, batch_size=batch_size,
+                           opset=opset, simplify=simplify, verbose=verbose)
+
+    def enable_ttt(self, config=None):
+        """
+        Enable Test-Time Training on this model.
+
+        After calling this, every model(x) forward pass automatically runs
+        `config.n_steps` inner-loop adaptation steps on a masked channel
+        reconstruction task before executing the main forward — zero call-site
+        changes required.
+
+        Parameters
+        ----------
+        config : TTTConfig or None
+            TTT hyper-parameters. None → TTTConfig defaults (n_steps=3, lr=1e-3).
+
+        Example
+        -------
+            model.enable_ttt()                        # defaults
+            model.enable_ttt(TTTConfig(n_steps=5, persist=True))
+            pred, aux = model(x)                      # TTT runs automatically
+            print(aux["ttt_aux_loss"])
+        """
+        from modules.ttt import TestTimeTrainer, TTTConfig
+        ttt = TestTimeTrainer(self, config or TTTConfig())
+        object.__setattr__(self, "_ttt", ttt)
+
+    def disable_ttt(self):
+        """Disable Test-Time Training, reverting to standard forward pass."""
+        object.__setattr__(self, "_ttt", None)
+        object.__setattr__(self, "_ttt_active", False)
 
     def init_cmla(self, modality_dims: List[int]):
         """Initialise CrossModalLatentAlignment for multi-modal inputs."""
@@ -498,7 +571,7 @@ class Vulgaris(Module):
 
         # Target: original x transposed to (B, T, C)
         x_target = Tensor(
-            x.data.transpose(0, 2, 1).astype(np.float64),
+            x.data.transpose(0, 2, 1).astype(np.float32),
             requires_grad=False,
         )  # (B, T, C)
 
@@ -517,7 +590,7 @@ class Vulgaris(Module):
 
         mae_loss_val = float(diff_sq_np.sum()) / n_masked
         mae_loss = Tensor(
-            np.array([[mae_loss_val]], dtype=np.float64),
+            np.array([[mae_loss_val]], dtype=np.float32),
             requires_grad=reconstructed.requires_grad,
             _children=(diff_sq,),
             _op="mae_loss"
@@ -597,7 +670,7 @@ class Vulgaris(Module):
             h_i_data = future_z.data[:, step_i, :]
             # Expand to (B, 1, d_model) for output_head which expects (..., T, d_model)
             h_i_3d = np.zeros((h_i_data.shape[0], 1, h_i_data.shape[1]),
-                               dtype=np.float64)
+                               dtype=np.float32)
             h_i_3d[:, 0, :] = h_i_data
             z_i = Tensor(h_i_3d, requires_grad=False)
             out_i = self.output_head(z_i)   # (B, output_dim)
@@ -632,6 +705,21 @@ class Vulgaris(Module):
                       output, aux = model(x_query, context=context)
         Returns (output, aux_losses).
         """
+        # ── TTT: run inner loop before main forward (skipped during aux pass) ──
+        _ttt  = object.__getattribute__(self, "_ttt")
+        _lock = object.__getattribute__(self, "_ttt_lock")
+        if _ttt is not None and _lock.acquire(blocking=False):
+            # Lock acquired: this thread runs TTT; concurrent threads skip it
+            # (they proceed with the base forward pass below).
+            try:
+                return _ttt.adapt_and_forward(
+                    x, domain_idx=domain_idx, timestamps=timestamps,
+                    use_safety=use_safety, mask=mask, context=context,
+                    use_imagination=use_imagination,
+                )
+            finally:
+                _lock.release()
+
         aux_losses: dict = {}
         cmla_loss = Tensor(np.array([[0.0]]), requires_grad=False)
 
@@ -682,8 +770,8 @@ class Vulgaris(Module):
             # Anomaly preservation: RevIN discards per-instance mean and std,
             # which ARE the signal for level-shift anomalies. Store them in
             # aux so downstream anomaly detection pipelines can use them.
-            revin_mean = self.revin.last_mean if hasattr(self.revin, "last_mean") else None
-            revin_std  = self.revin.last_std  if hasattr(self.revin, "last_std")  else None
+            revin_mean = self.revin._mean   # (B, C, 1) — stored by RevIN.normalize()
+            revin_std  = self.revin._std    # (B, C, 1)
             if revin_mean is not None:
                 aux_losses["revin_mean"] = revin_mean   # (B, C) or (B, C, 1)
                 aux_losses["revin_std"]  = revin_std
@@ -705,7 +793,18 @@ class Vulgaris(Module):
             dt_np = np.clip(dt_np, 1e-4, 10.0)
             dt_tensor = Tensor(dt_np, requires_grad=False)
 
-        z_ssm, _ = self.sssr(self.norm_sssr(z), dt=dt_tensor)
+        # ── DAH: load adapters BEFORE SSSR so all 4 projections are adapted ─
+        self.dah.set_domain(domain_idx)
+        adapters = self.dah.get_adapters(domain_idx)
+
+        # Pass all adapters to SSSR — x_proj, z_proj, y_proj, skip_proj are
+        # now applied as LoRA residuals at the correct internal projection points.
+        z_ssm, _ = self.sssr(
+            self.norm_sssr(z),
+            dt=dt_tensor,
+            domain_adapters=adapters,
+            adapter_layers=self.dah._adapter_layers,
+        )
         z = z + z_ssm
 
         # ── Causal Attention ─────────────────────────────────────────────
@@ -731,20 +830,19 @@ class Vulgaris(Module):
         else:
             aux_losses["icl_active"] = False
 
-        # ── DAH: domain adapter residual ──────────────────────────────────
-        self.dah.set_domain(domain_idx)
-        adapters = self.dah.get_adapters(domain_idx)
+        # ── DAH norm residual (additional domain shift on latent post-attention) ─
+        # Keeps the pre-attention DAH residual for backward compat while the
+        # primary adapter injection now happens inside SSSR above.
+        z_dah_in = self.norm_dah(z)
+        B_z, T_z, D_z = z_dah_in.data.shape
+        z_flat = z_dah_in.reshape(B_z * T_z, D_z)
         if "skip_proj" in adapters:
             A_d, B_d = adapters["skip_proj"]
-            z_dah_in = self.norm_dah(z)
-            B_z, T_z, D_z = z_dah_in.data.shape
-            z_flat = z_dah_in.reshape(B_z * T_z, D_z)
             z_adapt = self.dah._adapter_layers["skip_proj"](z_flat, A_d, B_d)
             z = z + z_adapt.reshape(B_z, T_z, D_z)
 
         # ── RMC: Regime detection — MUST run before CRG ───────────────────
-        z_rmc, rmc_balance = self.rmc(self.norm_rmc(z))
-        regime_weights_np = getattr(self.rmc, "last_regime_weights", None)
+        z_rmc, rmc_balance, regime_weights_np = self.rmc(self.norm_rmc(z))
         z = z + z_rmc
         aux_losses["rmc_balance_loss"] = float(rmc_balance.data.sum())
         object.__setattr__(self, "_last_regime_weights", regime_weights_np)
@@ -791,12 +889,22 @@ class Vulgaris(Module):
 
         # ── Safety filter (optional) ──────────────────────────────────────
         if use_safety:
-            # Use last timestep of z as state for safety head
-            state_np = z.data[:, -1, :]   # (batch, d_model)
-            state_t = Tensor(state_np, requires_grad=False)
-            # Safety head returns safe action: (batch, output_dim)
+            # x_t = last latent timestep (current state)
+            # x_t1 = one-step WorldModel prediction of next latent state
+            # CBF requires h(x_t) and h(x_{t+1}) to enforce forward invariance.
+            # Using the same state for both (previous bug) makes
+            #   L_cbf = ReLU(-(h(x)-h(x)) - γ·h(x)) = ReLU(-γ·h(x))
+            # which is trivially satisfied for γ>0, learning nothing.
+            state_np = z.data[:, -1, :]       # (B, d_model)
+            state_t  = Tensor(state_np, requires_grad=False)
+
+            # Predict next latent state via WorldModelHead (1-step rollout)
+            next_z_tensor, _ = self.world_model(state_t, horizon=1)
+            next_state_np = next_z_tensor.data[:, 0, :]   # (B, d_model)
+            next_state_t  = Tensor(next_state_np, requires_grad=False)
+
             safe_output = self.safety(state_t)
-            cbf_loss = self.safety.cbf_loss(state_t, state_t)
+            cbf_loss    = self.safety.cbf_loss(state_t, next_state_t)
             aux_losses["cbf_loss"] = float(cbf_loss.data.sum())
             output = safe_output
         else:
@@ -835,59 +943,87 @@ class Vulgaris(Module):
         dt: float | None = None,
     ) -> Tuple[Tensor, 'VulgarisState']:
         """
-        Single-step streaming inference.
+        Single-step streaming inference — matches forward() exactly.
+
+        Every module applied in forward() is applied here in the same order
+        with the same pre-norm layers.  The only differences from forward():
+          - RevIN uses stats from the last forward() call (stored in revin._mean/._std).
+            If unavailable, falls back to per-channel z-score of the single step.
+          - SSSR and HTD use external recurrent states instead of parallel scan.
+          - CausalAttention operates on T=1 (single-token, correct behaviour).
+          - ICL operates without context (gate ≈ 0 → near-identity).
+
         x_t : (batch, in_channels)
         state: VulgarisState
-        dt  : optional real elapsed time since last step (seconds) for adaptive timestep
+        dt  : optional elapsed time since last step (seconds)
         Returns (output_t, new_state)
         """
-        # Add time dim for ASE: (batch, in_channels, 1)
-        x_3d = Tensor(
-            x_t.data[:, :, None],
-            requires_grad=x_t.requires_grad,
-            _children=(x_t,),
-            _op="step_unsqueeze"
-        )
+        B, C = x_t.data.shape
+        x_3d_data = x_t.data[:, :, None].astype(np.float32)  # (B, C, 1)
 
-        def _step_unsq_back():
-            if x_t.requires_grad and x_3d.grad is not None:
-                contrib = x_3d.grad[:, :, 0]
-                x_t.grad = x_t.grad + contrib if x_t.grad is not None else contrib
+        # ── RevIN: use stored stats from last forward() call ──────────────
+        # RevIN computes stats over the T dimension; for T=1 we reuse the
+        # last window's statistics so the normalisation matches training.
+        rm = getattr(self.revin, '_mean', None)   # (B, C, 1) or None
+        rs = getattr(self.revin, '_std',  None)   # (B, C, 1) or None
+        if rm is not None and rm.shape[0] == B:
+            x_norm = (x_3d_data - rm) / (rs + self.revin.eps)
+        else:
+            # Fallback (first step): z-score across channels
+            mu    = x_3d_data.mean(axis=1, keepdims=True)
+            sigma = x_3d_data.std(axis=1,  keepdims=True) + self.revin.eps
+            x_norm = (x_3d_data - mu) / sigma
+        if self.revin.affine and self.revin.weight is not None:
+            x_norm = (x_norm * self.revin.weight.data[None, :, None]
+                      + self.revin.bias.data[None, :, None])
 
-        x_3d._backward = _step_unsq_back
+        x_3d = Tensor(x_norm.astype(np.float32), requires_grad=x_t.requires_grad)
 
-        # ASE on single step
-        z = self.ase(x_3d)           # (batch, 1, d_model)
+        # ── ASE ──────────────────────────────────────────────────────────
+        z = self.ase(x_3d)                               # (B, 1, d_model)
 
-        # HTD single step
-        htd_states_in = state.htd_states if state.htd_states else None
-        z_htd, new_htd_states = self.htd(z, htd_states_in)
+        # ── HTD with pre-norm ─────────────────────────────────────────────
+        htd_states_in = state.htd_states or None
+        z_htd, new_htd_states = self.htd(self.norm_htd(z), htd_states_in)
         z = z + z_htd
 
-        # SSSR single step — use real elapsed time as dt when provided
-        sssr_states_in = state.sssr_states if state.sssr_states else None
+        # ── SSSR with pre-norm, state, and all DAH adapters ───────────────
+        sssr_states_in = state.sssr_states or None
         dt_t = None
         if dt is not None:
-            B_s = x_t.data.shape[0]
-            dt_t = Tensor(np.full((B_s,), float(dt), dtype=np.float64), requires_grad=False)
-        z_ssm, new_sssr_states = self.sssr(z, sssr_states_in, dt=dt_t)
+            dt_t = Tensor(np.full((B,), float(dt), dtype=np.float32))
+        adapters = self.dah.get_adapters(domain_idx)
+        z_ssm, new_sssr_states = self.sssr(
+            self.norm_sssr(z),
+            sssr_states_in,
+            dt=dt_t,
+            domain_adapters=adapters,
+            adapter_layers=self.dah._adapter_layers,
+        )
         z = z + z_ssm
 
-        # RMC — detect current regime (must precede CRG)
-        z_rmc, _ = self.rmc(z)
-        regime_weights_np = getattr(self.rmc, "last_regime_weights", None)
+        # ── CausalAttention with pre-norm (T=1: single-token, correct) ───
+        z_attn = self.attn(self.norm_attn(z))
+        z = z + z_attn
+
+        # ── ICL with pre-norm (no context in streaming → near-identity) ──
+        z_icl = self.icl(self.norm_icl(z), ctx_stack=None)
+        z = z + z_icl
+
+        # ── RMC with pre-norm (must precede CRG) ─────────────────────────
+        z_rmc, _, regime_weights_np = self.rmc(self.norm_rmc(z))
         z = z + z_rmc
         object.__setattr__(self, "_last_regime_weights", regime_weights_np)
 
-        # CRG single step — conditioned on current regime
-        z_crg, _ = self.crg(z, regime_weights=regime_weights_np)
+        # ── CRG with pre-norm ─────────────────────────────────────────────
+        z_crg, _ = self.crg(self.norm_crg(z), regime_weights=regime_weights_np)
         z = z + z_crg
 
-        # HMB single step
-        z_hmb, _ = self.hmb(z, timestamp=state.step)
+        # ── HMB with pre-norm ─────────────────────────────────────────────
+        z_hmb, _ = self.hmb(self.norm_hmb(z), timestamp=state.step)
         z = z + z_hmb
 
-        # Output head
+        # ── Output head ───────────────────────────────────────────────────
         output = self.output_head(z)   # (batch, output_dim)
 
         new_state = VulgarisState(
@@ -947,29 +1083,283 @@ class Vulgaris(Module):
         Returns:
             predictions : (batch, horizon, output_dim) as a plain Tensor (no grad)
         """
+        was_training = self.training
         self.eval()
         B, C, T = x.data.shape
         state = self.init_state(B)
 
-        # Warm up state on context window
-        for t in range(T):
-            x_t = Tensor(x.data[:, :, t])        # (B, C)
-            _, state = self.step(x_t, state, domain_idx)
+        try:
+            # Warm up state on context window
+            for t in range(T):
+                x_t = Tensor(x.data[:, :, t])        # (B, C)
+                _, state = self.step(x_t, state, domain_idx)
 
-        # Autoregressive rollout
-        predictions = []
-        last_x = Tensor(x.data[:, :, -1])        # (B, C) — seed from last context step
-        for _ in range(horizon):
-            output_t, state = self.step(last_x, state, domain_idx)   # (B, output_dim)
-            predictions.append(output_t.data.copy())
-            # Project prediction back to input space (fill known dims, zero the rest)
-            next_input = np.zeros((B, C), dtype=np.float32)
-            out_dim = output_t.data.shape[-1]
-            next_input[:, :min(out_dim, C)] = output_t.data[:, :min(out_dim, C)]
-            last_x = Tensor(next_input)
+            # Autoregressive rollout
+            predictions = []
+            last_x = Tensor(x.data[:, :, -1])        # (B, C) — seed from last context step
+            for _ in range(horizon):
+                output_t, state = self.step(last_x, state, domain_idx)   # (B, output_dim)
+                predictions.append(output_t.data.copy())
+                # Project prediction back to input space (fill known dims, zero the rest)
+                next_input = np.zeros((B, C), dtype=np.float32)
+                out_dim = output_t.data.shape[-1]
+                next_input[:, :min(out_dim, C)] = output_t.data[:, :min(out_dim, C)]
+                last_x = Tensor(next_input)
 
-        preds_np = np.stack(predictions, axis=1)  # (B, horizon, output_dim)
+            preds_np = np.stack(predictions, axis=1)  # (B, horizon, output_dim)
+        finally:
+            if was_training:
+                self.train()
+
         return Tensor(preds_np)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Calibrated uncertainty via split conformal prediction
+    # ──────────────────────────────────────────────────────────────────────
+
+    def calibrate(
+        self,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray,
+        alpha: float = 0.1,
+        domain_idx: int = 0,
+    ) -> float:
+        """
+        Fit a split conformal predictor on a held-out calibration set.
+        Stores the (1-alpha) quantile of residuals so predict_with_interval()
+        can return guaranteed-coverage intervals — no new parameters required.
+
+        Parameters
+        ----------
+        X_cal : (N, C, T)  calibration inputs
+        y_cal : (N, 1)     calibration targets (normalised scale)
+        alpha : float       target miscoverage rate (default 0.10 → 90% coverage)
+
+        Returns
+        -------
+        float — the conformal quantile q_{1-alpha}
+        """
+        was_training = self.training
+        self.eval()
+        residuals = []
+        for i in range(len(X_cal)):
+            xb = Tensor(X_cal[i:i+1].astype(np.float32))
+            pred, _ = self(xb, domain_idx=domain_idx)
+            residuals.append(abs(float(pred.data.ravel()[0]) - float(y_cal[i].ravel()[0])))
+        # Finite-sample-corrected quantile
+        n = len(residuals)
+        q_level = min(1.0, (1.0 - alpha) * (1.0 + 1.0 / n))
+        q = float(np.quantile(residuals, q_level))
+        object.__setattr__(self, "_conformal_q",     q)
+        object.__setattr__(self, "_conformal_alpha", alpha)
+        if was_training:
+            self.train()
+        return q
+
+    def predict_with_interval(
+        self,
+        x: Tensor,
+        alpha: float | None = None,
+        **kwargs,
+    ) -> tuple[Tensor, np.ndarray, np.ndarray]:
+        """
+        Predict with conformal coverage interval [pred - q, pred + q].
+
+        Returns
+        -------
+        pred  : (B, output_dim) Tensor
+        lower : (B, output_dim) numpy — lower bound
+        upper : (B, output_dim) numpy — upper bound
+
+        Raises RuntimeError if calibrate() has not been called.
+        """
+        pred, aux = self(x, **kwargs)
+        q = getattr(self, "_conformal_q", None)
+        if q is None:
+            raise RuntimeError(
+                "Call model.calibrate(X_cal, y_cal) before predict_with_interval()"
+            )
+        if alpha is not None and alpha != getattr(self, "_conformal_alpha", alpha):
+            import warnings
+            warnings.warn(
+                f"Requested alpha={alpha} differs from calibration alpha="
+                f"{self._conformal_alpha}. Re-run calibrate() with the new alpha."
+            )
+        lower = pred.data - q
+        upper = pred.data + q
+        return pred, lower, upper
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Dedicated anomaly scoring path
+    # ──────────────────────────────────────────────────────────────────────
+
+    def score_anomaly(
+        self,
+        x: Tensor,
+        mask_ratio: float = 0.5,
+        domain_idx: int = 0,
+        max_hops: int = 3,
+    ) -> dict:
+        """
+        Compute a structured anomaly score for sensor input x.
+
+        Pipeline:
+          1. Reconstruction error  — mae_forward() on randomly masked channels
+          2. Embedding z-score     — deviation from running clean-data statistics
+          3. CRG failure propagation — triggered channels → downstream risk
+
+        Parameters
+        ----------
+        x          : (1, C, T) sensor window (batch=1)
+        mask_ratio : fraction of channels masked for reconstruction
+        max_hops   : propagation depth in causal graph
+
+        Returns
+        -------
+        dict with keys:
+          anomaly_score        float — combined score (higher = more anomalous)
+          reconstruction_error float — MSE on masked positions
+          embedding_zscore     float — max |z - μ| / σ in latent space
+          triggered_nodes      list[int] — channels with highest recon error
+          downstream_risk      dict[int, float] — CRG-propagated risk per node
+        """
+        was_training = self.training
+        self.eval()
+
+        # ── 1. Reconstruction error ───────────────────────────────────────
+        recon, mae_loss, mask_bool = self.mae_forward(x, mask_ratio=mask_ratio,
+                                                      domain_idx=domain_idx)
+        recon_error = float(mae_loss.data.sum())
+
+        # Per-channel reconstruction error (averaged over T and masked positions)
+        x_t  = x.data.transpose(0, 2, 1)   # (1, T, C)
+        diff  = np.abs(recon.data - x_t)    # (1, T, C)
+        mask_btc = mask_bool.transpose(0, 2, 1)  # (1, T, C)
+        ch_err = np.where(mask_btc, diff, 0).mean(axis=(0, 1))  # (C,)
+
+        # ── 2. Embedding z-score ──────────────────────────────────────────
+        _, aux     = self(x, domain_idx=domain_idx)
+        h          = aux.get("h_states")
+        embed_zscore = 0.0
+        if h is not None:
+            h_np = h.data[:, -1, :]             # (1, D)
+            mu   = getattr(self, "_anomaly_mu",  None)
+            std  = getattr(self, "_anomaly_std", None)
+            if mu is not None and std is not None:
+                embed_zscore = float((np.abs(h_np - mu) / (std + 1e-8)).max())
+
+        # ── 3. CRG failure propagation ────────────────────────────────────
+        n_ch = x.data.shape[1]
+        n_trigger = max(1, int(n_ch * 0.15))
+        triggered = np.argsort(ch_err)[-n_trigger:].tolist()
+
+        downstream: list = []
+        if hasattr(self.crg, "propagate_failure"):
+            downstream = self.crg.propagate_failure(
+                triggered_nodes=triggered, max_hops=max_hops, decay=0.85
+            )
+
+        if was_training:
+            self.train()
+
+        return {
+            "anomaly_score":        recon_error + embed_zscore,
+            "reconstruction_error": recon_error,
+            "embedding_zscore":     embed_zscore,
+            "triggered_nodes":      triggered,
+            "downstream_risk":      {n: p for n, p in downstream},
+        }
+
+    def update_anomaly_baseline(self, X_clean: np.ndarray, domain_idx: int = 0):
+        """
+        Fit running mean/std of embedding space on clean (normal) data.
+        Called once after pretraining on normal data; score_anomaly() uses
+        this to compute the embedding z-score.
+
+        X_clean : (N, C, T) array of normal-condition windows
+        """
+        was_training = self.training
+        self.eval()
+        hs = []
+        for i in range(len(X_clean)):
+            xb = Tensor(X_clean[i:i+1].astype(np.float32))
+            _, aux = self(xb, domain_idx=domain_idx)
+            h = aux.get("h_states")
+            if h is not None:
+                hs.append(h.data[:, -1, :])
+        if hs:
+            H = np.concatenate(hs, axis=0)   # (N, D)
+            object.__setattr__(self, "_anomaly_mu",  H.mean(axis=0, keepdims=True))
+            object.__setattr__(self, "_anomaly_std", H.std(axis=0,  keepdims=True) + 1e-8)
+        if was_training:
+            self.train()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 3. Online learning API
+    # ──────────────────────────────────────────────────────────────────────
+
+    def fit_one(
+        self,
+        x_t: "np.ndarray | Tensor",
+        y_t: "np.ndarray | Tensor",
+        optimizer,
+        ewc_lambda: float | None = None,
+    ) -> float:
+        """
+        Single-sample online update with EWC regularisation.
+
+        Runs forward → task loss + EWC penalty → backward → optimizer step →
+        shcal.maybe_consolidate().  Restores training state after completion.
+
+        Parameters
+        ----------
+        x_t         : (1, C, T) or Tensor — single sensor window
+        y_t         : (1, output_dim) or Tensor — target
+        optimizer   : SpectralAdamW (or any optimizer with .step())
+        ewc_lambda  : EWC penalty weight; None uses config.training.delta_ewc
+
+        Returns
+        -------
+        float — total loss value for this step
+        """
+        self.train()
+
+        if not isinstance(x_t, Tensor):
+            x_t = Tensor(np.asarray(x_t, dtype=np.float32))
+        if not isinstance(y_t, Tensor):
+            y_t = Tensor(np.asarray(y_t, dtype=np.float32))
+
+        # ── Task loss ─────────────────────────────────────────────────────
+        pred, aux = self(x_t)
+        diff      = pred - y_t
+        task_loss = (diff * diff).sum() * (1.0 / max(pred.data.size, 1))
+
+        # ── EWC penalty ───────────────────────────────────────────────────
+        if ewc_lambda is None:
+            ewc_lambda = getattr(self.config.training, "delta_ewc", 0.1)
+
+        ewc_val = 0.0
+        if ewc_lambda > 0 and self.shcal.fisher_diagonal:
+            from engine.tensor import Parameter as _P
+            current = {}
+            for idx, mod in enumerate(self.shcal.monitored_modules):
+                for attr in ("weight", "bias"):
+                    p = getattr(mod, attr, None)
+                    if isinstance(p, _P):
+                        current[f"{idx}.{attr}"] = p
+            ewc_t   = self.shcal.ewc_loss(current)
+            ewc_val = float(ewc_t.data.sum()) * ewc_lambda
+
+        # ── Backward + step ───────────────────────────────────────────────
+        for p in self.parameters():
+            p.grad = None
+        task_loss.backward()
+        optimizer.step()
+
+        # ── SHCAL consolidation ───────────────────────────────────────────
+        self.shcal.maybe_consolidate()
+
+        return float(task_loss.data.sum()) + ewc_val
 
     def set_domain(self, domain_idx: int):
         """Switch domain adapter."""
@@ -1034,10 +1424,23 @@ class Vulgaris(Module):
         config_path = os.path.join(path, "config.yaml")
         self.config.to_yaml(config_path)
 
+        # ── Runtime memory persistence ────────────────────────────────────
+        # EpisodicMemory and CausalMemory accumulate cross-session state
+        # (context vectors, causal edge history) that should survive restarts.
+        import pickle
+        ep = object.__getattribute__(self, "episodic_memory")
+        cm = object.__getattribute__(self, "causal_memory")
+        if ep is not None:
+            with open(os.path.join(path, "episodic_memory.pkl"), "wb") as fh:
+                pickle.dump(ep, fh, protocol=4)
+        if cm is not None:
+            with open(os.path.join(path, "causal_memory.pkl"), "wb") as fh:
+                pickle.dump(cm, fh, protocol=4)
+
         # Metadata
         meta = {
-            "vulgaris_version": "0.1.0",
-            "format_version":   1,
+            "vulgaris_version": "0.8.0",
+            "format_version":   2,
             "saved_at":         time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "n_base_params":    self.n_base_params(),
             "n_adapter_params": self.n_adapter_params(),
@@ -1046,6 +1449,8 @@ class Vulgaris(Module):
             "output_dim":       self.config.output_dim,
             "n_classes":        self.config.n_classes,
             "weights_sha256":   weights_sha256,
+            "has_episodic_memory": ep is not None,
+            "has_causal_memory":   cm is not None,
         }
         with open(os.path.join(path, "metadata.json"), "w") as f:
             json.dump(meta, f, indent=2)
@@ -1074,7 +1479,7 @@ class Vulgaris(Module):
             with open(meta_path) as f:
                 meta = json.load(f)
             fmt_ver = meta.get("format_version", 1)
-            if fmt_ver > 1:
+            if fmt_ver > 2:
                 raise ValueError(
                     f"Checkpoint format version {fmt_ver} is newer than this "
                     f"vulgaris version (supports up to format_version=1). "
@@ -1114,5 +1519,22 @@ class Vulgaris(Module):
         data = np.load(weights_path, allow_pickle=False)
         state = {k: data[k].astype(np.float32) for k in data.files}
         model.load_state_dict(state)
+
+        # ── Restore runtime memory ────────────────────────────────────────
+        import pickle as _pickle
+        ep_path = os.path.join(path, "episodic_memory.pkl")
+        if os.path.exists(ep_path):
+            with open(ep_path, "rb") as fh:
+                ep = _pickle.load(fh)
+            object.__setattr__(model, "episodic_memory", ep)
+            # Re-wire into ICL so future encode_context() calls use restored memory
+            model.icl.episodic_memory = ep
+
+        cm_path = os.path.join(path, "causal_memory.pkl")
+        if os.path.exists(cm_path):
+            with open(cm_path, "rb") as fh:
+                cm = _pickle.load(fh)
+            object.__setattr__(model, "causal_memory", cm)
+            model.crg.attach_causal_memory(cm)
 
         return model

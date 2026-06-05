@@ -18,7 +18,7 @@ Complete mathematical reference for every algorithm used in VULGARIS.
 10. [SHCAL — Self-Healing Continual Adaptation Layer](#10-shcal--self-healing-continual-adaptation-layer)
 11. [CMLA — Cross-Modal Latent Alignment](#11-cmla--cross-modal-latent-alignment)
 12. [Loss — Unified Variational Loss](#12-loss--unified-variational-loss)
-13. [Optimizer — SpectralAdamW, PCGrad & CosineSchedule](#13-optimizer--spectraladamw-pcgrad--cosine-schedule)
+13. [Optimizer — SpectralAdamW, PCGrad, MuonOptimizer & CosineSchedule](#13-optimizer--spectraladamw-pcgrad-muonoptimizer--cosine-schedule)
 14. [Distributed Training — Data-Parallel Allreduce](#14-distributed-training--data-parallel-allreduce)
 15. [Log Encoder — O(1) Template Extraction](#15-log-encoder--o1-template-extraction)
 16. [Event Buffer — Shared-Memory Ring Buffer](#16-event-buffer--shared-memory-ring-buffer)
@@ -37,6 +37,9 @@ Complete mathematical reference for every algorithm used in VULGARIS.
 29. [Speculative Rollout — Draft-Verify Autoregressive Decoding](#29-speculative-rollout--draft-verify-autoregressive-decoding)
 30. [ICL — In-Context Learning](#30-icl--in-context-learning)
 31. [Ontology Embedding — Industrial Semantic Context](#31-ontology-embedding--industrial-semantic-context)
+32. [EpisodicMemory — Cross-Session Ring Buffer](#32-episodic-memory--cross-session-ring-buffer)
+33. [CausalMemory — Append-Only Triple Store](#33-causal-memory--append-only-triple-store)
+34. [MultiHorizonHead — Joint Multi-Step Forecasting](#34-multihorizonhead--joint-multi-step-forecasting)
 
 ---
 
@@ -152,14 +155,20 @@ h_new     = A_bar · h_prev + B_bar · x_t
 y         = C · h_new + D · x_t                   (skip connection D)
 ```
 
-### Matrix Exponential Trace (NOTEARS Gradient)
+### DAGMA DAG Penalty (replaces NOTEARS)
 
 ```
-tr(expm(W)) computed via scipy.linalg.expm
-Gradient:  d/dW tr(expm(W)) = expm(W)^T
+h(W) = −log det(sI − W⊙W) − n·log(s)    s = 1.0 (scale parameter)
+
+Forward:  A = s·I − W⊙W
+          h = −log det(A) − n·log(s)        via np.linalg.slogdet
+
+Gradient: d(h)/d(W_ij) = 2·W_ij · A^{-T}_{ij}    A^{-T} via Cholesky solve
 ```
 
-Used inside the NOTEARS penalty: `h(W) = tr(expm(W ⊙ W)) − n`.
+Strictly convex near DAG solutions; avoids the local minima of the
+NOTEARS power-series expansion and requires only one Cholesky factorisation
+per backward pass (O(n³)) vs. a dense matrix exponential.
 
 ### Top-K Sparse (Straight-Through)
 
@@ -179,6 +188,29 @@ Soft mask (within top-k only):
 Jacobian (for backward, within top-k):
   d(s_j·k)/d(score_m) = (k/T) · s_j · (δ[j==m] − s_m)
 ```
+
+### Log-Space Parallel Scan (Hillis-Steele, Underflow-Safe)
+
+For SSM sequences with T > 1000, cumulative products of decay values
+a[t] ∈ (0,1) underflow to zero in float32. The log-space scan avoids this.
+
+Forward (Hillis-Steele, stride doubling):
+```
+  log_fa = log(clip(a, 1e-7, 1.0))     (B, T, D) — log of cumulative factor
+  fb     = b.copy()                     (B, T, D) — partial sums in linear space
+
+  stride = 1
+  while stride < T:
+      idx = [stride, stride+1, …, T-1]
+      src = idx − stride
+      log_fa[:, idx] += log_fa[:, src]                          (log-domain add)
+      fb[:, idx]     += exp(log_fa_prev[:, idx]) * fb_prev[:, src]
+
+  h = fb                                final hidden states
+```
+
+This is numerically equivalent to the standard scan but stable for any T.
+Used as the default numpy backend in engine/parallel_scan.py.
 
 ---
 
@@ -217,13 +249,25 @@ Scale s uses dilation `d = 2^s`. The effective kernel span is:
 K_eff = (K − 1) · d + 1
 ```
 
-### Channel Mixing
+### Channel-Independent Processing (iTransformer-style)
+
+Applying W_mix before the wavelet convolution conflates channel identities
+before CRG's causal discovery. ASE instead processes each channel separately:
 
 ```
-x_mixed = W_mix · x              (W_mix ∈ ℝ^{n_filters × C_in})
+For each input channel c in {0, …, C-1}:
+  x_c_scaled[b, f, t] = x[b, c, t] · W_mix[f, c]   scale by per-filter weight
+  For each scale s:
+    out[c,s] = fft_conv1d(x_c_scaled, kernels_2d, dilation=2^s)  → (B, n_filters, T)
+
+Aggregate over channels (sum):
+  out_s = Σ_c out[c, s]                               (B, n_filters, T)
+
+Concatenate scales → (B, n_scales·n_filters, T) → transpose → (B, T, total_ch)
 ```
 
-Implemented as einsum: `x_mixed[b, f, t] = Σ_i W_mix[f, i] · x[b, i, t]`
+This ensures per-channel frequency extraction occurs BEFORE cross-channel mixing,
+preserving channel identity for CRG's causal graph learning.
 
 ---
 
@@ -247,6 +291,34 @@ h_t = A_t ⊙ h_{t-1} + B_t ⊙ x_t
 ```
 softplus(x) = log(1 + exp(clip(x, −20, 20)))
 ```
+
+### HiPPO-LegS Timescale Initialisation
+
+log_A is initialised with a log-uniform spacing of decay rates across state
+dimensions, inspired by the HiPPO-LegS polynomial basis projection:
+
+```
+  log_A[n] = linspace(−4.0, −0.2, state_dim)[n]    n = 0 … state_dim−1
+```
+
+State dimension 0 decays slowest (λ ≈ e^{−4} ≈ 0.018, long-range memory);
+state dimension N−1 decays fastest (λ ≈ e^{−0.2} ≈ 0.819, short-range).
+This multi-timescale initialisation dramatically improves convergence on
+multi-scale industrial signals compared to the flat log(0.5) initialisation.
+
+### Adaptive Timestep (Irregular Sampling)
+
+When inter-sample intervals dt are known (e.g., from timestamps), they are
+passed directly to override the learned dt projection:
+
+```
+  If dt provided:  Δt = softplus(dt)   (skips W_dt projection)
+  Else:            Δt = softplus(W_dt · x_t + b_dt)
+```
+
+This enables correct ZOH discretisation for irregular-rate sensor streams
+without retraining — the decay A_t = exp(−exp(log_A) · Δt) automatically
+adapts to the true sample spacing.
 
 ### Output Projection
 
@@ -362,23 +434,69 @@ Collisions resolved by linear probing.
 
 **File:** `modules/crg.py`
 
-Learns a sparse directed acyclic graph over sensor nodes using the NOTEARS penalty and online Granger-style structure updates.
+Learns a sparse directed acyclic graph over sensor nodes using the DAGMA penalty,
+a learned Neural Granger mask, regime-conditioned adjacency, and online Granger-style
+structure updates. The effective adjacency used for message passing is:
 
-### NOTEARS DAG Penalty
+  W_eff = (W + Σ_k regime_weights[k] · W_regime_bias[k]) ⊙ sigmoid(M)
 
-A weighted adjacency matrix W represents no cycles iff:
+### DAGMA DAG Penalty
+
+Replaces NOTEARS `tr(exp(W⊙W)) - n` with the strictly-convex DAGMA formulation:
 
 ```
-h(W) = tr(expm(W ⊙ W)) − n = 0
+h(W) = −log det(sI − W⊙W) − n·log(s)    s = 1.0
 
-expm(A) ≈ I + A + A²/2! + A³/3! + A⁴/4! + A⁵/5! + A⁶/6!
-where A = W ⊙ W   (element-wise square)
+Forward:  A = I − W⊙W
+          h = −log|det(A)|   via np.linalg.slogdet (numerically stable)
+
+Gradient: ∂h/∂W_ij = 2·W_ij · [A^{-T}]_{ij}
+          A^{-T} computed via Cholesky (A is positive-definite near the DAG manifold)
 ```
+
+DAGMA is strictly convex near DAG solutions; NOTEARS has local minima from the
+finite Taylor expansion of the matrix exponential.
+
+### Neural Granger Mask
+
+Learnable parameter M ∈ ℝ^{n×n} (logits), self-loops initialised to −10.
+
+```
+W_gated = W ⊙ sigmoid(M)     applied after regime blending
+```
+
+During structure update, M is nudged by the Granger signal:
+```
+M[i,j] ← M[i,j] + lr_M · sign(granger_acc[i,j])    lr_M = 0.01
+```
+
+L1 penalty on sigmoid(M) drives unused edges to zero:
+```
+L_mask = λ_mask · Σ_{i,j} sigmoid(M[i,j])
+```
+
+This provides genuine learned causal discovery: W captures relationship strength,
+M decides which edges exist at all.
+
+### Regime-Conditioned Adjacency
+
+```
+W_regime_bias ∈ ℝ^{K × n × n}    one additive bias matrix per regime
+```
+
+When regime_weights (K,) are provided by RMC:
+```
+W_adj = W + Σ_k regime_weights[k] · W_regime_bias[k]
+W_eff = W_adj ⊙ sigmoid(M)
+```
+
+Different operating regimes (startup, steady-state, fault) have distinct
+causal graph structures.
 
 ### Message Passing
 
 ```
-updated = node_states + node_states @ W_sparse     (W_sparse is top-k entries of W)
+updated = node_states + node_states @ W_sparse     (W_sparse = top-k entries of W_eff)
 ```
 
 ### Granger Causality (Online)
@@ -396,60 +514,61 @@ G_ij = mean_l |corr_ij(l)|
 ### EMA Structure Update
 
 ```
-acc ← 0.9 · acc + 0.1 · G                  (exponential moving average)
-W   ← W  + lr_struct · (acc − |W|)          lr_struct = 1e-3
+acc ← 0.9 · acc + 0.1 · G
+W   ← W  + lr_struct · (acc − |W|)
 ```
+
+After each update, discovered edges with |W_eff[i,j]| > 0.1 are written to
+CausalMemory (if attached): `causal_memory.record(i, j, |W_eff[i,j]|)`.
+
+### Failure Propagation
+
+Given a set of triggered (anomalous) sensor nodes, forward-propagates failure
+probability through the causal graph with multiplicative decay per hop:
+
+```
+Algorithm: BFS from triggered_nodes, max_hops steps
+prob[j] = max over all paths: Π(edge_weights) · decay^hop_count
+
+decay = 0.85 (configurable)
+```
+
+Returns dict {node_id → failure_probability}.
 
 ### Regularisation
 
 ```
-L_dag  = λ_dag  · h(W)
-L_spar = λ_spar · Σ_{i,j} |W_ij|
-L_reg  = L_dag + L_spar
+L_dag  = λ_dag  · h(W)                    (DAGMA acyclicity penalty)
+L_spar = λ_spar · Σ_{i,j} |W_ij|          (sparsity)
+L_mask = λ_mask · Σ_{i,j} sigmoid(M_ij)   (mask sparsity)
+L_reg  = L_dag + L_spar + L_mask
 ```
 
 ### Conditional Independence Pruning
 
-After every `ci_update_interval` steps, each active edge (i→j) is tested for spurious correlation.
+After every `ci_update_interval` steps, each active edge (i→j) is tested.
 
-**Confounder selection** — score each candidate node k by the harmonic mean of its Pearson correlations with both i and j:
-
+Confounder selection — score each candidate node k:
 ```
 score(k) = 2 · |r_ik| · |r_jk| / (|r_ik| + |r_jk| + ε)
 ```
 
-Top-2 highest-scoring nodes form the conditioning set S.
-
-**Partial correlation** — residualise i and j on S via OLS, then correlate residuals:
-
+Partial correlation with top-2 conditioning set S:
 ```
 x_i_res = x_i − X_S · (X_S^T X_S + εI)^{-1} X_S^T x_i
 x_j_res = x_j − X_S · (X_S^T X_S + εI)^{-1} X_S^T x_j
-
 pcorr(i,j | S) = corr(x_i_res, x_j_res)
 ```
 
-**Edge decision:**
-
+Edge pruning:
 ```
 if |pcorr(i,j | S)| < ci_threshold:
-    W[i,j] ← 0               (prune spurious edge)
-    edge_label[i,j] ← "associative"
-else:
-    edge_label[i,j] ← "causal"
+    W[i,j] ← 0    M[i,j] ← −10    (prune both weight and mask)
 ```
 
 ### NaN Collapse Guard
 
-Before every structure update, W is checked for non-finite values:
-
-```
-if any non-finite in W:
-    W ← N(0, 0.01²)  with diagonal zeroed
-    granger_accumulator ← 0
-```
-
-This prevents NaN propagation from corrupting the DAG penalty gradient.
+If any non-finite value in W: reset W ~ N(0, 0.01²), zero diagonal, reset acc.
 
 ---
 
@@ -769,7 +888,7 @@ L_temporal = mean ‖h_{t} − h_{t-1}‖²
 
 ---
 
-## 13. Optimizer — SpectralAdamW, PCGrad & CosineSchedule
+## 13. Optimizer — SpectralAdamW, PCGrad, MuonOptimizer & CosineSchedule
 
 **File:** `training/optimizer.py`
 
@@ -1220,23 +1339,58 @@ CMLA fuses all modalities → z_fused ∈ ℝ^{B × T × d_model}
 ASE is bypassed; z_fused enters the core stack directly.
 ```
 
-### Core Processing Stack
+### Core Processing Stack (Pre-Norm Architecture)
 
-Single-modality path `x ∈ ℝ^{B×C_in×T}`:
+Single-modality path `x ∈ ℝ^{B×C_in×T}`. Pre-norm (RMSNorm before each
+module, GPT-3/LLaMA style) applied at every step for training stability.
 
 ```
-z = ASE(RevIN(x))              → (B, T, d_model)
-z = z + HTD(z)                 → multi-timescale residual
-z = z + SSSR(z)                → SSM residual
-z = z + CausalAttention(z)     → attention residual
-z = ICL(z, context) if context provided
-z = DAH.forward(z, layer_name="skip_proj", domain_idx)
-z = z + CRG(z)                 → causal routing + dag_penalty
-z = z + HMB(z)                 → memory retrieval + memory_loss
-ŷ = OutputHead(z[:, -1, :])    → last-timestep projection
+z = ASE(RevIN(x))                        → (B, T, d_model)
+
+z = z + HTD(norm_htd(z))                → multi-timescale residual
+z = z + SSSR(norm_sssr(z), dt=dt)       → SSM residual; dt from timestamps diff
+z = z + CausalAttention(norm_attn(z))   → attention residual
+z = ICL(norm_icl(z), context,
+        retrieve_k=4)      if context   → ICL + episodic retrieval
+z = DAH(norm_dah(z), domain_idx)        → domain-adapted projection
+
+# RMC BEFORE CRG — regime weights condition the causal graph
+z_rmc, balance_loss, regime_weights = RMC(norm_rmc(z))
+z = z + z_rmc
+
+crg_out, dag_penalty = CRG(norm_crg(z), regime_weights=regime_weights)
+z = z + crg_out
+
+z = z + HMB(norm_hmb(z))               → memory retrieval + memory_loss
+
+ŷ = OutputHead(z[:, -1, :])            → last-timestep classification/regression
 ŷ = SafetyHead(ŷ) if use_safety
+
+# Multi-horizon forecasting (regression mode only)
+mh = mean_pool(z) → [Linear_h(·) for h in horizons]  → (B, n_horizons, out_dim)
+aux["multi_horizon"] = mh
+
+# RevIN stats preserved for anomaly detection
+aux["revin_mean"] = μ_c
+aux["revin_std"]  = σ_c
+aux["anomaly_energy"] = ‖ŷ_denorm − ŷ_norm‖
+
 ESE.record(z) during training
+SHCAL.maybe_consolidate() during training
 ```
+
+### Timestamp → dt Pipeline
+
+Raw timestamps (B, T) are converted to inter-sample intervals before SSSR:
+
+```
+ts_np = timestamps.data                           (B, T), seconds
+dt_np = np.diff(ts_np, axis=1).clip(1e-4, 10.0)  (B, T-1)
+dt_tensor = Tensor(dt_np)
+```
+
+Passed as `dt` to SSSR, enabling correct ZOH discretisation for irregular
+sensor sampling rates without any model architecture change.
 
 ### Causal Self-Attention
 
@@ -1764,6 +1918,29 @@ L_balance = balance_weight · K · Σ_k  f_k · P_k
 
 This loss (Fedus et al., 2021) penalises configurations where $f_k$ and $P_k$ are simultaneously large for the same expert, pushing the router towards uniform utilisation without using a non-differentiable operation in the backward pass.
 
+### Sparse Top-k Routing (Straight-Through)
+
+When `top_k < n_experts`, only the top-k experts by gating weight are
+activated per token:
+
+```
+topk_idx = argsort(weights, axis=-1)[:, -top_k:]     (N, top_k)
+mask      = zeros_like(weights)
+mask[topk_idx] = 1.0
+weights_sparse = weights * mask / (weights*mask).sum(-1, keepdims=True)
+
+weights_full = weights.copy()    (pre-mask; used in backward only)
+```
+
+Straight-through gradient: the softmax backward uses weights_full instead of
+weights_sparse, so inactive experts still receive gradient signal:
+
+```
+d_scores = weights_full * (g − (g * weights_full).sum(-1, keepdims=True)) / τ
+```
+
+This prevents expert collapse (all load to k experts; others never train).
+
 ### Regime Assignments
 
 ```
@@ -1771,6 +1948,18 @@ regime_assignments() → argmax(logits, axis=-1)    (B, T)  int64
 ```
 
 Returns the single most-likely expert index per token, used downstream for interpretability and per-regime metric tracking.
+
+### Regime Weights Output
+
+`forward()` returns a 3-tuple: `(z_out, balance_loss, regime_weights)`.
+
+```
+regime_weights = weights_full.mean(axis=0)    (K,)  float32
+```
+
+Computed once from the full (pre-mask) softmax weights averaged across B×T tokens.
+Passed directly to CRG so CRG never needs to re-run gate_proj to condition its
+effective adjacency matrix.
 
 **Design decisions:**
 - Temperature $\tau > 1$ softens the routing distribution, smoothing gradients early in training; $\tau = 1$ recovers hard top-1 routing in the limit.
@@ -1958,14 +2147,21 @@ effective_speedup = (accepted_steps · γ + rejected_steps) / total_full_model_s
 
 Zero-shot adaptation at inference time without weight updates: a small set of reference (context) examples is encoded into a context vector which is injected into the main stream via cross-attention with a gated residual.
 
-### ContextEncoder
+### ContextEncoder (Attention Pooling)
 
-Given $N$ reference examples $\{(\mathbf{x}^{(i)}, \mathbf{y}^{(i)})\}_{i=1}^N$, each pair is independently encoded and mean-pooled:
+Given $N$ reference examples $\{(\mathbf{x}^{(i)}, \mathbf{y}^{(i)})\}_{i=1}^N$:
 
 ```
-h_i = MLP([x_i ‖ y_i])                      per-example encoding
-c   = (1/N) · Σ_i h_i                        context vector  ∈ ℝ^{d_ctx}
+h_i  = MLP([x_i ‖ y_i])                     per-example encoding (B, n_ex, d_model)
+
+# Attention pool over reference timesteps (replaces mean-pool)
+q    = pool_q(h_i)                           (B, n_ex, 1)  learned query
+α    = softmax(q, dim=1)                     (B, n_ex, 1)  attention weights
+c    = Σ_i α_i · h_i                         (B, d_model)  context vector
 ```
+
+The learned attention pool (pool_q: Linear(d_model, 1)) selects which reference
+timesteps matter most rather than averaging all equally.
 
 ### InContextAdapter (Cross-Attention)
 
@@ -1990,6 +2186,25 @@ h_out = h + g · ctx_out
 ```
 
 Near-zero gate initialisation is critical: it ensures the adapter is a near-identity at the start of fine-tuning and does not disrupt pretrained representations.
+
+### Episodic Memory Integration
+
+When an `EpisodicMemory` is attached:
+
+```
+encode_context():
+  1. Encode current context → c  ∈ ℝ^{d_model}
+  2. Store: episodic_memory.store(key=c, value=c)
+  3. If retrieve_k > 0:
+       keys, vals, scores, _ = episodic_memory.retrieve(c, top_k=retrieve_k)
+       retrieved ∈ ℝ^{retrieve_k × d_model}
+       context_set = concat([retrieved, c.unsqueeze(0)], dim=0)  → (retrieve_k+1, d_model)
+```
+
+Retrieved past episodes are prepended to the current context set and attended
+jointly — giving ICL persistent cross-session memory without any weight updates.
+
+Cosine retrieval: score(q, k) = (q/‖q‖) · (k/‖k‖)
 
 **Design decisions:**
 - Mean-pooling over context examples is permutation-invariant and makes the adapter robust to context ordering.
@@ -2040,3 +2255,135 @@ lookup(domain_name) → e_domain ∈ ℝ^{d_ont}
 - Sharing embeddings at cluster granularity (not per-term) reduces the parameter count from 80·d to 12·d while preserving the semantic grouping structure.
 - Mean-pooling is differentiable and order-invariant, so domain embeddings can be updated by gradient-based domain adaptation without requiring a fixed term ordering.
 - The 80-term vocabulary covers the major IEC 61131 / IEC 61508 / 3GPP industrial sensor categories; extensions are added by registering new terms to existing clusters.
+
+---
+
+## 32. EpisodicMemory — Cross-Session Ring Buffer
+
+**File:** `memory/episodic.py`
+
+Fixed-capacity ring buffer for persisting context vectors across inference
+sessions, with cosine-similarity retrieval for in-context learning.
+
+### Storage
+
+```
+capacity = 512   (configurable)
+buffer: np.ndarray  (capacity, d_model)  float32
+meta:   list of metadata dicts
+
+write_ptr = 0   (cycles: write_ptr ← (write_ptr + 1) % capacity)
+```
+
+On `store(key, value, metadata)`:
+```
+buffer[write_ptr] = key / (‖key‖ + ε)       (store unit-normalised key)
+values[write_ptr] = value
+meta[write_ptr]   = metadata
+write_ptr ← (write_ptr + 1) % capacity
+n_stored  ← min(n_stored + 1, capacity)
+```
+
+### Retrieval
+
+On `retrieve(query, top_k)`:
+```
+q̂ = query / (‖query‖ + ε)
+scores = buffer[:n_stored] @ q̂             (n_stored,)  cosine similarities
+top_idx = argsort(scores)[-top_k:][::-1]  (top_k,) descending
+return keys[top_idx], values[top_idx], scores[top_idx], meta[top_idx]
+```
+
+O(n_stored · d_model) per retrieval — acceptable for capacity ≤ 512.
+
+---
+
+## 33. CausalMemory — Append-Only Triple Store
+
+**File:** `memory/causal.py`
+
+Append-only store of (cause, effect, confidence) triples with O(1) inverted-index
+lookup. Written by CRG during `update_structure()`; readable by any module.
+
+### Storage
+
+```
+triples: list of (cause, effect, confidence)     chronological
+cause_index:  dict[cause  → list[idx]]           inverted index
+effect_index: dict[effect → list[idx]]           inverted index
+capacity = 4096   (FIFO eviction when exceeded)
+```
+
+On `record(cause, effect, confidence)`:
+```
+if len(triples) >= capacity:
+    oldest = triples.pop(0)
+    remove oldest from cause_index and effect_index
+triples.append((cause, effect, confidence))
+cause_index[cause].append(len(triples)-1)
+effect_index[effect].append(len(triples)-1)
+```
+
+### Queries
+
+```
+query_effects(cause, min_confidence=0.1):
+    idx = cause_index.get(cause, [])
+    return [(triples[i].effect, triples[i].confidence)
+            for i in idx if triples[i].confidence >= min_confidence]
+
+query_causes(effect, min_confidence=0.1):
+    idx = effect_index.get(effect, [])
+    return [(triples[i].cause, triples[i].confidence)
+            for i in idx if triples[i].confidence >= min_confidence]
+
+strongest_edges(top_k=20):
+    return sorted(triples, key=lambda t: -t.confidence)[:top_k]
+```
+
+All lookups are O(degree) in the number of edges touching the queried node.
+
+---
+
+## 34. MultiHorizonHead — Joint Multi-Step Forecasting
+
+**File:** `model/vulgaris.py`
+
+Produces forecasts at multiple horizons simultaneously in a single forward pass,
+avoiding the need for iterative autoregressive rollout for common forecast horizons.
+
+### Architecture
+
+```
+horizons = config.forecast_horizons  (default [1, 5, 20] steps ahead)
+n_horizons = len(horizons)
+
+For each horizon h_i:
+    head_i: Linear(d_model → output_dim)
+```
+
+### Forward Pass
+
+```
+Input:  z ∈ ℝ^{B × T × d_model}   (full latent sequence from main stack)
+
+pool   = mean(z, axis=1)           ∈ ℝ^{B × d_model}   (global context)
+
+out_i  = head_i(pool)              ∈ ℝ^{B × output_dim}   for each i
+
+output = stack([out_i for i in range(n_horizons)], axis=1)
+                                   ∈ ℝ^{B × n_horizons × output_dim}
+```
+
+Stored in `aux_losses["multi_horizon"]` on every forward pass.
+
+### Training
+
+Multi-horizon outputs can be supervised directly when multi-step targets are
+available:
+```
+L_mh = (1 / n_horizons) · Σ_i ‖mh_pred[:, i, :] − y[:, horizon_i, :]‖²
+```
+
+Mean pooling uses the full T-step latent sequence (not just the last timestep),
+giving the head global temporal context for longer horizon predictions.

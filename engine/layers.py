@@ -453,9 +453,26 @@ class RevIN(Module):
             object.__setattr__(self, "weight", None)
             object.__setattr__(self, "bias", None)
 
-        # These are populated by normalize() and consumed by denormalize()
-        self._mean: Optional[np.ndarray] = None
-        self._std: Optional[np.ndarray] = None
+        # Thread-local storage for per-request mean/std so concurrent inference
+        # requests cannot overwrite each other's statistics.
+        import threading
+        object.__setattr__(self, "_tl", threading.local())
+
+    @property
+    def _mean(self) -> Optional[np.ndarray]:
+        return getattr(self._tl, "mean", None)
+
+    @_mean.setter
+    def _mean(self, v: Optional[np.ndarray]):
+        self._tl.mean = v
+
+    @property
+    def _std(self) -> Optional[np.ndarray]:
+        return getattr(self._tl, "std", None)
+
+    @_std.setter
+    def _std(self, v: Optional[np.ndarray]):
+        self._tl.std = v
 
     def normalize(self, x: Tensor) -> Tensor:
         """Normalize x: (B, C, T) -> (B, C, T).  Stores mean/std for denormalize."""
@@ -463,7 +480,7 @@ class RevIN(Module):
         mean = x.data.mean(axis=-1, keepdims=True)          # (B, C, 1)
         std = x.data.std(axis=-1, keepdims=True) + self.eps  # (B, C, 1)
 
-        # 2. Store for denormalize
+        # 2. Store thread-locally — safe in multi-threaded serving
         self._mean = mean
         self._std = std
 

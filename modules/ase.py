@@ -14,136 +14,113 @@ class AdaptiveSignalEmbedding(Module):
     using learnable Morlet-style continuous-time filter banks at multiple scales.
 
     x: (batch, in_channels, T) -> (batch, T, latent_dim)
+
+    Improvements over baseline:
+    - Filter cache: kernels recomputed only when wavelet params change.
+    - Linear interpolation: missing positions interpolated instead of
+      zero-padded, eliminating the frequency bias in FFT convolution.
     """
 
     def __init__(self, in_channels: int, n_filters: int, n_scales: int,
                  filter_len: int, latent_dim: int):
         super().__init__()
         self.in_channels = in_channels
-        self.n_filters = n_filters
-        self.n_scales = n_scales
-        self.filter_len = filter_len
-        self.latent_dim = latent_dim
+        self.n_filters   = n_filters
+        self.n_scales    = n_scales
+        self.filter_len  = filter_len
+        self.latent_dim  = latent_dim
 
-        # Learnable wavelet parameters per filter: shape (n_filters,)
-        # Amplitude: log_A -> A = exp(log_A)
-        self.log_A = Parameter(
-            np.zeros(n_filters, dtype=np.float32), name="log_A"
-        )
-        # Width: log_sigma -> sigma = exp(log_sigma)
-        self.log_sigma = Parameter(
-            np.zeros(n_filters, dtype=np.float32), name="log_sigma"
-        )
-        # Frequency
-        self.omega = Parameter(
-            np.linspace(1.0, 8.0, n_filters, dtype=np.float32), name="omega"
-        )
-        # Phase
-        self.phi = Parameter(
-            np.zeros(n_filters, dtype=np.float32), name="phi"
-        )
+        self.log_A     = Parameter(np.zeros(n_filters, dtype=np.float32), name="log_A")
+        self.log_sigma = Parameter(np.zeros(n_filters, dtype=np.float32), name="log_sigma")
+        self.omega     = Parameter(np.linspace(1.0, 8.0, n_filters, dtype=np.float32), name="omega")
+        self.phi       = Parameter(np.zeros(n_filters, dtype=np.float32), name="phi")
 
-        # Total channels after multi-scale concatenation: n_scales * n_filters
-        # Each scale applies n_filters filters to (in_channels + optional ts) input channels
-        # We apply the filter bank independently to each input channel and sum
-        # Output per scale: (batch, n_filters, T)
-        total_channels = n_scales * n_filters
-
-        # in_channels + 1 accounts for optional timestamp channel
-        # We build separate conv weights but here we project the per-channel
-        # filter output to n_filters via a mixing linear applied after summing
-        # over input channels. The actual dilated conv treats each input channel
-        # separately (groups=in_channels possible but we keep it general).
-        # For simplicity: conv has in_channels -> n_filters via the wavelet kernel
-        # (one wavelet per output filter, applied across ALL input channels simultaneously).
-        # Weight shape for grouped approach: (n_filters, in_channels, filter_len) -- but
-        # we materialise the wavelet for a single in_channel and use it for all.
-        # We store a per-filter, per-input-channel scale parameter for mixing.
         self.channel_mix = Parameter(
             np.random.randn(n_filters, in_channels + 1).astype(np.float32) * 0.02,
-            name="channel_mix"
+            name="channel_mix",
         )
 
+        total_channels = n_scales * n_filters
         self.proj = Linear(total_channels, latent_dim)
         self.norm = RMSNorm(latent_dim)
 
+        # Filter cache — invalidated when any wavelet param changes
+        object.__setattr__(self, "_filter_cache", None)
+        object.__setattr__(self, "_filter_fp",    None)
+
     # ------------------------------------------------------------------
+
+    def _wavelet_fingerprint(self) -> tuple:
+        return (
+            float(self.log_A.data.sum()),
+            float(self.log_sigma.data.sum()),
+            float(self.omega.data.sum()),
+            float(self.phi.data.sum()),
+        )
+
     def _build_filters(self) -> np.ndarray:
         """
         Materialise the (n_filters, 1, filter_len) Morlet wavelet kernel.
+        Result is cached and only recomputed when wavelet parameters change.
 
-        t grid: linspace(-filter_len//2, filter_len//2, filter_len) / filter_len
-        psi_k(t) = A_k * exp(-0.5 * (t / sigma_k)^2) * cos(omega_k * t + phi_k)
+        psi_k(t) = A_k * exp(-0.5*(t/sigma_k)^2) * cos(omega_k*t + phi_k)
         """
-        fl = self.filter_len
-        t = np.linspace(-fl // 2, fl // 2, fl, dtype=np.float32) / fl  # (fl,)
+        fp     = self._wavelet_fingerprint()
+        cached = object.__getattribute__(self, "_filter_cache")
+        if cached is not None and fp == object.__getattribute__(self, "_filter_fp"):
+            return cached
 
-        A = np.exp(self.log_A.data)        # (n_filters,)
-        sigma = np.exp(self.log_sigma.data) # (n_filters,)
-        omega = self.omega.data             # (n_filters,)
-        phi = self.phi.data                 # (n_filters,)
+        fl    = self.filter_len
+        t     = np.linspace(-fl // 2, fl // 2, fl, dtype=np.float32) / fl
 
-        # Broadcast: (n_filters, fl)
-        t_s = t[None, :] / sigma[:, None]                         # (n_filters, fl)
-        gauss = np.exp(-0.5 * t_s ** 2)                           # (n_filters, fl)
-        carrier = np.cos(omega[:, None] * t[None, :] + phi[:, None])  # (n_filters, fl)
-        kernels = A[:, None] * gauss * carrier                    # (n_filters, fl)
+        A     = np.exp(self.log_A.data)
+        sigma = np.exp(self.log_sigma.data)
+        omega = self.omega.data
+        phi   = self.phi.data
 
-        # Normalise each filter to unit energy to stabilise training
-        energy = np.sqrt((kernels ** 2).sum(axis=1, keepdims=True) + 1e-8)
-        kernels = kernels / energy
+        t_s     = t[None, :] / sigma[:, None]
+        gauss   = np.exp(-0.5 * t_s ** 2)
+        carrier = np.cos(omega[:, None] * t[None, :] + phi[:, None])
+        kernels = A[:, None] * gauss * carrier
 
-        return kernels.reshape(self.n_filters, 1, fl)             # (n_filters, 1, fl)
+        energy  = np.sqrt((kernels ** 2).sum(axis=1, keepdims=True) + 1e-8)
+        kernels = (kernels / energy).reshape(self.n_filters, 1, fl)
+
+        object.__setattr__(self, "_filter_cache", kernels)
+        object.__setattr__(self, "_filter_fp",    fp)
+        return kernels
 
     # ------------------------------------------------------------------
-    def _dilated_conv1d(self, x_np: np.ndarray, kernel_np: np.ndarray,
-                        dilation: int, padding: int) -> np.ndarray:
+
+    @staticmethod
+    def _linear_interp_masked(x_np: np.ndarray,
+                              missing: np.ndarray) -> np.ndarray:
         """
-        Dilated convolution via zero-insertion between filter taps.
+        Replace missing positions with linear interpolation between nearest
+        valid neighbours.  Eliminates the zero-padding frequency bias that
+        distorts FFT-based wavelet convolution (Khayati et al. VLDB 2020).
 
-        x_np    : (batch, C, T)
-        kernel_np: (C_out, C_in, K)  with C_in == 1 here (applied per channel)
-        dilation: int >= 1
-        padding : int (pre-computed for "same" output length)
-
-        Returns (batch, C_out, T)
+        x_np    : (B, C, T)
+        missing : (B, C, T)  True = missing / invalid
+        Returns : (B, C, T)  with gaps filled
         """
-        C_out, C_in, K = kernel_np.shape
-
-        if dilation == 1:
-            dilated_k = kernel_np
-        else:
-            # Effective kernel length after zero-insertion
-            K_eff = (K - 1) * dilation + 1
-            dilated_k = np.zeros((C_out, C_in, K_eff), dtype=np.float32)
-            dilated_k[:, :, ::dilation] = kernel_np
-
-        K_eff = dilated_k.shape[2]
+        result = x_np.copy()
         B, C, T = x_np.shape
-
-        # Manual padding along time axis
-        if padding > 0:
-            x_pad = np.pad(x_np, ((0, 0), (0, 0), (padding, padding)), mode="constant")
-        else:
-            x_pad = x_np
-
-        T_out = x_pad.shape[2] - K_eff + 1
-        out = np.zeros((B, C_out, T_out), dtype=np.float32)
-
-        for k in range(K_eff):
-            if dilated_k[0, 0, k] == 0.0 and dilation > 1:
-                # Zero tap — skip (only valid if the tap is actually zero)
-                # Check properly: skip if this tap is zero in all filters
-                if np.all(dilated_k[:, :, k] == 0.0):
+        for b in range(B):
+            for c in range(C):
+                m = missing[b, c]
+                if not m.any():
                     continue
-            # x_pad[:, :, k : k + T_out] : (B, C, T_out)
-            # dilated_k[:, :, k]         : (C_out, C_in)
-            # We need sum over C_in: (B, C_out, T_out)
-            out += np.einsum("oi,bit->bot", dilated_k[:, :, k], x_pad[:, :, k:k + T_out])
-
-        return out  # (B, C_out, T_out)
+                valid = np.where(~m)[0]
+                if len(valid) == 0:
+                    continue
+                result[b, c, np.where(m)[0]] = np.interp(
+                    np.where(m)[0], valid, x_np[b, c, valid]
+                )
+        return result
 
     # ------------------------------------------------------------------
+
     def forward(
         self,
         x: Tensor,
@@ -153,166 +130,193 @@ class AdaptiveSignalEmbedding(Module):
         """
         x          : (batch, in_channels, T)
         timestamps : optional (batch, T) — normalize to [0,1] and append as extra channel
-        mask       : optional boolean array, (batch, T) or (batch, in_channels, T).
-                     True = valid, False = missing. Missing positions are zeroed before
-                     convolution so they do not contaminate neighbouring timesteps.
+        mask       : optional bool array (batch, T) or (batch, in_channels, T).
+                     True = valid, False = missing.  Missing positions are
+                     linearly interpolated before convolution.
         Returns    : (batch, T, latent_dim)
         """
-        B, C, T = x.data.shape
-        # Apply missing-value mask before any computation
-        if mask is not None:
-            mask_np = np.asarray(mask, dtype=np.float32)
-            if mask_np.ndim == 2:          # (B, T) -> broadcast over channels
-                mask_np = mask_np[:, None, :]
-            x_np = x.data * mask_np        # zero out missing positions
-        else:
-            x_np = x.data  # work in numpy for the wavelet convolution
+        from engine.fft_conv import fft_conv1d, fft_conv1d_backward
 
+        B, C, T = x.data.shape
+
+        # ── Missing-value handling ────────────────────────────────────────
+        if mask is not None:
+            mask_np = np.asarray(mask, dtype=bool)
+            if mask_np.ndim == 2:
+                mask_np = np.broadcast_to(mask_np[:, None, :], (B, C, T)).copy()
+            missing = ~mask_np
+            x_np    = self._linear_interp_masked(x.data.copy(), missing)
+        else:
+            x_np = x.data
+
+        # ── Optional timestamp channel ────────────────────────────────────
         if timestamps is not None:
-            ts_np = timestamps.data  # (B, T)
-            # Normalize each window to [0,1]
-            ts_min = ts_np.min(axis=1, keepdims=True)
-            ts_max = ts_np.max(axis=1, keepdims=True)
-            ts_norm = (ts_np - ts_min) / (ts_max - ts_min + 1e-8)  # (B, T)
-            ts_ch = ts_norm[:, None, :]   # (B, 1, T)
-            x_np = np.concatenate([x_np, ts_ch], axis=1)  # (B, C+1, T)
+            ts_np   = timestamps.data
+            ts_min  = ts_np.min(axis=1, keepdims=True)
+            ts_max  = ts_np.max(axis=1, keepdims=True)
+            ts_norm = (ts_np - ts_min) / (ts_max - ts_min + 1e-8)
+            x_np    = np.concatenate([x_np, ts_norm[:, None, :]], axis=1)
             actual_in = C + 1
         else:
-            # Pad channel_mix to only use C channels
             actual_in = C
-            x_np = x_np  # (B, C, T)
 
-        # Build wavelet kernels: (n_filters, 1, filter_len)
-        kernels_1ch = self._build_filters()  # (n_filters, 1, filter_len)
+        # ── Wavelet kernels (cached) ──────────────────────────────────────
+        kernels_1ch = self._build_filters()           # (n_filters, 1, fl)
+        kernels_2d  = kernels_1ch[:, 0, :]            # (n_filters, fl)
 
-        # Mix input channels: project (B, actual_in, T) -> (B, n_filters, T)
-        # using channel_mix: (n_filters, in_channels+1) -> select first actual_in cols
-        cm = self.channel_mix.data[:, :actual_in]  # (n_filters, actual_in)
-        # (B, n_filters, T) = einsum over input channels
-        x_mixed = np.einsum("fi,bit->bft", cm, x_np)  # (B, n_filters, T)
-        # x_mixed now has n_filters channels, ready for per-filter single-channel conv
+        cm      = self.channel_mix.data[:, :actual_in]
+        x_mixed = np.einsum("fi,bit->bft", cm, x_np)
 
-        fl = self.filter_len
-        kernels_2d = kernels_1ch[:, 0, :]  # (n_filters, fl)
-
-        from engine.fft_conv import fft_conv1d
-
-        # Channel-independent extraction: apply the wavelet bank to each input
-        # channel separately so the model never conflates channel identities before
-        # causal discovery (CRG) has had a chance to learn which channels relate.
-        # Result: (B, actual_in, n_scales * n_filters, T) → reduce over channels last.
-        scale_outputs_per_channel = []   # list over channels; each: list of (B, n_filters, T)
-
-        for c in range(actual_in):
-            x_c = x_np[:, c:c+1, :]          # (B, 1, T) — single channel
-            # channel_mix[k, c] scales how much filter k uses channel c
-            cm_c = cm[:, c]                   # (n_filters,) scaling per filter
-            # Expand x_c to (B, n_filters, T) by scaling each filter independently
-            x_c_expanded = np.broadcast_to(x_c, (x_c.shape[0], self.n_filters, x_c.shape[2])).copy()
-            x_c_expanded = x_c_expanded * cm_c[None, :, None]   # (B, n_filters, T)
-
-            ch_scales = []
-            for s in range(self.n_scales):
-                dilation = 2 ** s
-                out_s = fft_conv1d(x_c_expanded, kernels_2d, dilation=dilation)  # (B, n_filters, T)
-                ch_scales.append(out_s)
+        # ── Channel-independent extraction ────────────────────────────────
+        scale_outputs_per_channel = []
+        for c_idx in range(actual_in):
+            x_c   = x_np[:, c_idx:c_idx+1, :]
+            cm_c  = cm[:, c_idx]
+            x_exp = np.broadcast_to(
+                x_c, (x_c.shape[0], self.n_filters, x_c.shape[2])
+            ).copy() * cm_c[None, :, None]
+            ch_scales = [
+                fft_conv1d(x_exp, kernels_2d, dilation=2 ** s)
+                for s in range(self.n_scales)
+            ]
             scale_outputs_per_channel.append(ch_scales)
 
-        # Aggregate over channels: sum contributions (equivalent to the old channel_mix einsum
-        # but computed AFTER the per-channel frequency extraction, not before)
-        scale_outputs = []
-        for s in range(self.n_scales):
-            out_s = sum(scale_outputs_per_channel[c][s] for c in range(actual_in))
-            scale_outputs.append(out_s)   # (B, n_filters, T)
+        scale_outputs = [
+            sum(scale_outputs_per_channel[ci][s] for ci in range(actual_in))
+            for s in range(self.n_scales)
+        ]
 
-        # Concatenate scales: (B, n_scales * n_filters, T)
-        multi_scale = np.concatenate(scale_outputs, axis=1)  # (B, total_ch, T)
+        multi_scale   = np.concatenate(scale_outputs, axis=1)
+        multi_scale_t = multi_scale.transpose(0, 2, 1).astype(np.float32)
 
-        # Transpose to (B, T, total_ch) for Linear
-        multi_scale_t = multi_scale.transpose(0, 2, 1)  # (B, T, total_ch)
-
-        # Wrap in Tensor with gradient linkage through channel_mix and wavelet params
-        # The numpy path breaks autograd; we reconnect by building a Tensor that
-        # records the channel_mix dependency for gradient flow.
-        # For full autodiff we propagate through channel_mix manually.
-        total_ch = self.n_scales * self.n_filters
-
-        # Build output Tensor — attach channel_mix as child so its grad flows
+        # ── Autograd-connected Tensor ─────────────────────────────────────
+        total_ch  = self.n_scales * self.n_filters
         ms_tensor = Tensor(
             multi_scale_t,
             requires_grad=x.requires_grad or self.channel_mix.requires_grad,
             _children=(x, self.channel_mix, self.log_A, self.log_sigma,
                        self.omega, self.phi),
-            _op="ase_multiscale"
+            _op="ase_multiscale",
         )
 
-        # Backward: compute grad w.r.t. channel_mix and wavelet params numerically
-        # via finite differences would be heavy; instead we implement the analytic path.
-        _x_np = x_np.copy()
+        _x_np    = x_np.copy()
         _cm_data = cm.copy()
-        _kernels = kernels_1ch.copy()
-        _kernels_2d = kernels_2d.copy()
+        _k2d     = kernels_2d.copy()
         _x_mixed = x_mixed.copy()
-        _scale_outs = [s.copy() for s in scale_outputs]
-        _multi_scale = multi_scale.copy()
-        _T = T
-        _B = B
-        _actual_in = actual_in
+        _T, _B, _ai, _nf = T, B, actual_in, self.n_filters
+
+        # Pre-compute quantities needed for wavelet param gradients.
+        # We capture these from _build_filters to avoid recomputing inside backward.
+        _fl    = self.filter_len
+        _t_grid = np.linspace(-_fl // 2, _fl // 2, _fl, dtype=np.float32) / _fl
+        _A     = np.exp(self.log_A.data).copy()       # (n_filters,)
+        _sigma = np.exp(self.log_sigma.data).copy()   # (n_filters,)
+        _omega = self.omega.data.copy()               # (n_filters,)
+        _phi   = self.phi.data.copy()                 # (n_filters,)
+        # kernels (unit-energy normalised) already stored in _k2d: (n_filters, fl)
 
         def _ase_back():
-            g = ms_tensor.grad  # (B, T, total_ch)
+            g = ms_tensor.grad
             if g is None:
                 return
-            # Transpose back to (B, total_ch, T)
-            g_bct = g.transpose(0, 2, 1)  # (B, n_scales*n_filters, T)
+            g_bct = g.transpose(0, 2, 1)
+
+            # Accumulate grad_kernel across all scales (needed for wavelet params)
+            g_kernel_total = np.zeros((_nf, _fl), dtype=np.float32)
 
             if self.channel_mix.requires_grad:
-                # grad w.r.t. cm: (n_filters, actual_in)
-                # multi_scale[s*nf:(s+1)*nf] = dilated_conv(x_mixed, kernels_1ch[k])
-                # x_mixed = cm @ x_np -> dL/dcm = sum_s (dL/d_out_s @ d_out_s/d_x_mixed) @ x_np^T
-                # For each scale s: out_s = dilated_conv(x_mixed, kernels_1ch, dilation=2^s)
-                # dout_s/d_x_mixed[filter_k, t] involves the convolution kernel
-                # We approximate: dL/d_x_mixed via transposed convolution
-                from engine.fft_conv import fft_conv1d_backward
-                g_cm = np.zeros_like(self.channel_mix.data)
-                g_xmixed = np.zeros((_B, self.n_filters, _T), dtype=np.float32)
-
+                g_cm     = np.zeros_like(self.channel_mix.data)
+                g_xmixed = np.zeros((_B, _nf, _T), dtype=np.float32)
                 for s in range(self.n_scales):
-                    g_s = g_bct[:, s * self.n_filters:(s + 1) * self.n_filters, :]
-                    # FFT-based transposed conv: O(T log T) vs O(T*K) loop
-                    g_xm_s, _ = fft_conv1d_backward(
+                    g_s = g_bct[:, s * _nf:(s + 1) * _nf, :]
+                    g_xm_s, g_k_s = fft_conv1d_backward(
                         g_s.astype(np.float32),
                         _x_mixed.astype(np.float32),
-                        _kernels_2d.astype(np.float32),
+                        _k2d.astype(np.float32),
                         dilation=2 ** s,
                     )
                     g_xmixed += g_xm_s
-
-                g_cm[:, :_actual_in] = np.einsum("bft,bit->fi", g_xmixed, _x_np)
-                self.channel_mix.grad = (self.channel_mix.grad + g_cm
-                                         if self.channel_mix.grad is not None else g_cm)
+                    g_kernel_total += g_k_s
+                g_cm[:, :_ai] = np.einsum("bft,bit->fi", g_xmixed, _x_np)
+                self.channel_mix.grad = (
+                    self.channel_mix.grad + g_cm
+                    if self.channel_mix.grad is not None else g_cm
+                )
 
             if x.requires_grad:
-                from engine.fft_conv import fft_conv1d_backward
-                g_xmixed2 = np.zeros((_B, self.n_filters, _T), dtype=np.float32)
-
+                g_xmixed2 = np.zeros((_B, _nf, _T), dtype=np.float32)
                 for s in range(self.n_scales):
-                    g_s = g_bct[:, s * self.n_filters:(s + 1) * self.n_filters, :]
-                    g_xm_s, _ = fft_conv1d_backward(
+                    g_s = g_bct[:, s * _nf:(s + 1) * _nf, :]
+                    g_xm_s, g_k_s = fft_conv1d_backward(
                         g_s.astype(np.float32),
                         _x_mixed.astype(np.float32),
-                        _kernels_2d.astype(np.float32),
+                        _k2d.astype(np.float32),
                         dilation=2 ** s,
                     )
                     g_xmixed2 += g_xm_s
+                    if not self.channel_mix.requires_grad:
+                        g_kernel_total += g_k_s
+                g_x    = np.einsum("fi,bft->bit", _cm_data, g_xmixed2)
+                contrib = g_x[:, :C, :]
+                x.grad  = x.grad + contrib if x.grad is not None else contrib
 
-                g_x = np.einsum("fi,bft->bit", _cm_data, g_xmixed2)
-                contrib_x = g_x[:, :C, :]
-                x.grad = x.grad + contrib_x if x.grad is not None else contrib_x
+            # ── Wavelet parameter gradients ─────────────────────────────────
+            # Chain rule through _build_filters():
+            #   kernels[f,τ] = A[f]*gauss[f,τ]*cos(ω[f]*t[τ]+φ[f]) / energy[f]
+            #
+            # g_kernel_total[f,τ] = d(loss)/d(kernels[f,τ])
+            # We backprop through: kernels → (log_A, log_sigma, omega, phi)
+            # Approximation: treat energy normalization as constant (stop-gradient
+            # on energy) — standard trick for normalized filterbanks.
+            if (self.log_A.requires_grad or self.log_sigma.requires_grad or
+                    self.omega.requires_grad or self.phi.requires_grad):
+                t  = _t_grid                              # (fl,)
+                ts = t[None, :] / _sigma[:, None]         # (n_filters, fl)
+                gauss   = np.exp(-0.5 * ts ** 2)          # (n_filters, fl)
+                arg     = _omega[:, None] * t + _phi[:, None]
+                cos_arg = np.cos(arg)                      # (n_filters, fl)
+                sin_arg = np.sin(arg)                      # (n_filters, fl)
+
+                # d(kernels)/d(log_A[f])   = kernels[f,:] (since A=exp(log_A))
+                if self.log_A.requires_grad:
+                    g_logA = (_k2d * g_kernel_total).sum(axis=1)  # (n_filters,)
+                    self.log_A.grad = (
+                        self.log_A.grad + g_logA
+                        if self.log_A.grad is not None else g_logA
+                    )
+
+                # d(kernels)/d(log_sigma[f]) = kernels[f,:] * (t/sigma[f])^2
+                if self.log_sigma.requires_grad:
+                    g_logS = (_k2d * ts ** 2 * g_kernel_total).sum(axis=1)
+                    self.log_sigma.grad = (
+                        self.log_sigma.grad + g_logS
+                        if self.log_sigma.grad is not None else g_logS
+                    )
+
+                # d(kernels)/d(omega[f])  ∝ -t * sin(ω*t+φ) * A*gauss/energy
+                if self.omega.requires_grad:
+                    d_omega = _A[:, None] * gauss * (-t * sin_arg)
+                    energy  = np.sqrt((_k2d ** 2).sum(axis=1, keepdims=True) + 1e-8)
+                    d_omega = d_omega / energy
+                    g_omega = (d_omega * g_kernel_total).sum(axis=1)
+                    self.omega.grad = (
+                        self.omega.grad + g_omega
+                        if self.omega.grad is not None else g_omega
+                    )
+
+                # d(kernels)/d(phi[f])    ∝ -sin(ω*t+φ) * A*gauss/energy
+                if self.phi.requires_grad:
+                    d_phi = _A[:, None] * gauss * (-sin_arg)
+                    energy = np.sqrt((_k2d ** 2).sum(axis=1, keepdims=True) + 1e-8)
+                    d_phi  = d_phi / energy
+                    g_phi  = (d_phi * g_kernel_total).sum(axis=1)
+                    self.phi.grad = (
+                        self.phi.grad + g_phi
+                        if self.phi.grad is not None else g_phi
+                    )
 
         ms_tensor._backward = _ase_back
 
-        # Project to latent dim: (B, T, total_ch) -> (B, T, latent_dim)
         out = self.proj(ms_tensor)
         out = self.norm(out)
-        return out  # (B, T, latent_dim)
+        return out

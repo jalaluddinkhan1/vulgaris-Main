@@ -7,6 +7,29 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.8.0] — 2026-06-02
+
+### Added
+- **TestTimeTrainer + TTTConfig** (`modules/ttt.py`): test-time training via masked channel reconstruction; wired into `Vulgaris.enable_ttt()` / `disable_ttt()` so every `model(x)` call automatically runs K inner-loop adaptation steps — zero call-site changes required.
+- **41 new public symbols** exported from `vulgaris.__init__`: sub-classes `SSSRHead`, `HTDLevel`, `MemoryVAE`, `AdapterLayer`, `CARTExtractor`, `DecisionNode`, `ModalityEncoder`, `CBFLayer`, `SpectralNormLinear`, `MultiTaskHead`, `InContextAdapter`, `ContextEncoder`, `RuleConditionLoss`, `RuleDistiller`, `RuleLifecycleManager`, `RevIN` — plus engine utilities `zeros`, `ones`, `randn`, `rand`, `cat`, `stack`.
+- **modules/revin.py, modules/causal_memory.py, modules/episodic_memory.py**: thin re-export stubs so `RevIN`, `CausalMemory`, `EpisodicMemory` are discoverable under `modules.*`.
+- **ONNX export** (`serve/onnx_export.py`): `model.export_onnx(path)` bridges numpy weights to a PyTorch trace and writes a self-contained `.onnx` file; `benchmark_onnx()` runs latency profiling via ONNX Runtime. Needs `pip install "vulgaris[export]"`.
+- **CRGConfig** gains `ci_threshold: float = 0.05` and `n_regimes: int = 4` — previously accessed via `getattr` fallbacks; now proper dataclass fields.
+- **CMLAConfig wired into CrossModalLatentAlignment**: `__init__` now accepts `config: CMLAConfig | None` and applies `contrastive_temp` / `contrastive_weight` from it.
+
+### Fixed
+- **`Vulgaris.load()` crash**: `ModelConfig.from_yaml()` was deserializing nested configs (`ase`, `sssr`, etc.) as plain dicts instead of dataclass instances, causing `AttributeError` on load. Now reconstructs each nested field as the correct dataclass type.
+- **`revin_mean` / `anomaly_energy` always None**: vulgaris.py checked `hasattr(revin, "last_mean")` but RevIN stores `self._mean`. Fixed to use `self.revin._mean` / `self.revin._std` directly.
+- **RMC regime_weights never flowed to CRG**: `rmc.forward()` had the `return z_out, balance_loss` line missing `regime_weights` despite computing it. Changed to `return z_out, balance_loss, regime_weights`; vulgaris.py updated to 3-value unpack.
+- **ASE filter cache**: `_build_filters()` now caches kernel computation and only recomputes when wavelet parameters change.
+- **ASE missing-value interpolation**: masked sensor positions are now linearly interpolated instead of zero-padded, eliminating the FFT frequency bias.
+- **`vulgaris_version` in save() metadata**: was `"0.1.0"`, now `"0.8.0"`.
+- **Type annotations**: `crg.attach_causal_memory`, `icl.__init__` (episodic_memory), `dah.attach_ontology_embedding`, `dah.attach_rule_encoder` all annotated with `TYPE_CHECKING` guards.
+
+### Changed
+- `vulgaris/__init__.py` public API: 68 → **110 symbols**
+- `modules/__init__.py` re-exports all 17 module files with full sub-class surface
+
 ## [Unreleased]
 
 ### Planned

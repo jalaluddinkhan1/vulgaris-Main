@@ -37,8 +37,11 @@ class CRGConfig:
     sparsity_lambda: float = 0.05
     dag_lambda: float = 1.0
     n_lags: int = 5
-    update_interval: int = 100
+    update_interval: int = 1000  # raised from 100 — O(N²) CI test spikes training latency
     max_edges: int = 256
+    ci_threshold: float = 0.05   # partial-correlation threshold for edge pruning
+    n_regimes: int = 4           # number of regime-conditioned adjacency biases
+    max_ci_edges: int = 64       # cap edges checked per CI update to bound O(N²) cost
 
 
 @dataclass
@@ -121,6 +124,7 @@ class RMCConfig:
     n_experts: int = 4
     tau: float = 1.0
     balance_weight: float = 0.01
+    top_k: int = 0   # 0 = soft routing (all experts); >0 = sparse top-k routing
 
 
 @dataclass
@@ -174,7 +178,33 @@ class ModelConfig:
     def from_yaml(cls, path: str) -> "ModelConfig":
         with open(path) as f:
             d = yaml.safe_load(f)
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+        # Map field names to their nested dataclass types so YAML dicts are
+        # reconstructed as proper dataclass instances (not plain dicts).
+        from config import (ASEConfig, SSSRConfig, CRGConfig, HMBConfig,
+                            SHCALConfig, DAHConfig, ESEConfig, HTDConfig,
+                            SafetyConfig, TrainingConfig, MultiTaskConfig,
+                            RMCConfig, CMLAConfig, ICLConfig)
+        NESTED = {
+            "ase": ASEConfig, "sssr": SSSRConfig, "crg": CRGConfig,
+            "hmb": HMBConfig, "shcal": SHCALConfig, "dah": DAHConfig,
+            "ese": ESEConfig, "htd": HTDConfig, "safety": SafetyConfig,
+            "training": TrainingConfig, "multitask": MultiTaskConfig,
+            "rmc": RMCConfig, "cmla": CMLAConfig, "icl": ICLConfig,
+        }
+
+        kwargs = {}
+        for k, v in d.items():
+            if k not in cls.__dataclass_fields__:
+                continue
+            if k in NESTED and isinstance(v, dict):
+                subcls = NESTED[k]
+                valid  = {fk: fv for fk, fv in v.items()
+                          if fk in subcls.__dataclass_fields__}
+                kwargs[k] = subcls(**valid)
+            else:
+                kwargs[k] = v
+        return cls(**kwargs)
 
     def to_yaml(self, path: str):
         import dataclasses

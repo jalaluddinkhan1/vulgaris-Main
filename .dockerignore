@@ -1,13 +1,37 @@
+# Version control
 .git
 .github
-.qodo
+.gitignore
+
+# IDE / tools
 .venv
+.vscode
+.idea
+.qodo
 __pycache__
 *.py[cod]
+*.pyo
+
+# Build artefacts
 *.egg-info
+dist/
+build/
 .pytest_cache
 .mypy_cache
 .ruff_cache
-dist
-build
-checkpoints
+coverage.xml
+.coverage
+
+# Runtime state (mounted as volumes)
+checkpoints/
+
+# Dev / docs (not needed in image)
+tests/
+benchmarks/
+examples/
+deploy/
+paper.md
+ALGORITHMS.md
+CHANGELOG.md
+OVERVIEW.md
+*.ipynb

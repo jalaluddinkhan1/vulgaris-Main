@@ -787,7 +787,7 @@ class TestWorldModelHead(unittest.TestCase):
         h = Tensor(np.random.randn(2, 16).astype(np.float32))
         future_z, uncs = wm(h, horizon=4)
         self.assertEqual(future_z.data.shape, (2, 4, 16))
-        self.assertEqual(len(uncs), 4)
+        self.assertEqual(uncs.shape[1], 4)
 
     def test_standalone_finite(self):
         from model.vulgaris import WorldModelHead
@@ -810,7 +810,7 @@ class TestWorldModelHead(unittest.TestCase):
         h = Tensor(np.random.randn(2, 16))
         future_z, uncs = wm(h, horizon=3)
         self.assertEqual(future_z.data.shape[1], 3)
-        self.assertEqual(len(uncs), 3)
+        self.assertEqual(uncs.shape[1], 3)
 
     def test_world_model_forward_keys(self):
         m = _model(d=16)
@@ -827,7 +827,7 @@ class TestWorldModelHead(unittest.TestCase):
         self.assertEqual(result["future_latents"].data.shape, (2, 3, 16))
         self.assertEqual(result["future_outputs"].shape, (2, 3, 2))
         self.assertEqual(result["current_output"].data.shape, (2, 2))
-        self.assertEqual(len(result["uncertainties"]), 3)
+        self.assertEqual(result["uncertainties"].shape[1], 3)
 
     def test_world_model_forward_finite(self):
         m = _model(d=16)

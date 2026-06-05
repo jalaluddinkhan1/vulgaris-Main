@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 import numpy as np
 
 from engine.tensor import Tensor, Parameter, zeros
 from engine.module import Module
 from engine.layers import Linear, RMSNorm
+
+if TYPE_CHECKING:
+    from config import CMLAConfig
 
 
 class ModalityEncoder(Module):
@@ -44,11 +48,22 @@ class CrossModalLatentAlignment(Module):
     """
 
     def __init__(self, modality_dims: list[int], d_model: int,
-                 temperature: float = 0.07):
+                 temperature: float = 0.07,
+                 config: "CMLAConfig | None" = None):
+        """
+        config : optional CMLAConfig — when provided, its contrastive_temp and
+                 contrastive_weight fields override the temperature argument.
+        """
         super().__init__()
         self.n_modalities = len(modality_dims)
         self.d_model = d_model
-        self.temperature = temperature
+        # CMLAConfig takes precedence over the bare temperature kwarg
+        if config is not None:
+            self.temperature          = config.contrastive_temp
+            self.contrastive_weight   = config.contrastive_weight
+        else:
+            self.temperature          = temperature
+            self.contrastive_weight   = 0.1
 
         # One encoder per modality
         for m, d_in in enumerate(modality_dims):
@@ -190,21 +205,33 @@ class CrossModalLatentAlignment(Module):
         Returns scalar loss Tensor.
         """
         M = self.n_modalities
-        # Stack and flatten: (M, B, T, D) -> (M*B*T, D)
         B, T, D = embeddings[0].shape
-        N = M * B * T
 
-        # Collect data
-        z_list_np = [z.data.reshape(B * T, D) for z in embeddings]  # each (B*T, D)
-        # Full matrix: (N, D) where first B*T rows = modality 0, next B*T = modality 1, ...
-        z_all_np = np.concatenate(z_list_np, axis=0)   # (N, D)
+        # ── Timestep sub-sampling to prevent OOM ─────────────────────────
+        # Full N = M*B*T.  At T=1024, B=32, M=4 → N=131,072 → sim is 137 GB.
+        # Sub-sample k timesteps per modality per batch item.
+        # k=64 is sufficient for InfoNCE to converge (Liu et al. 2021).
+        max_t = getattr(self, "max_contrastive_timesteps", 64)
+        if T > max_t:
+            t_idx = np.random.choice(T, size=max_t, replace=False)
+            z_sub = [z.data[:, t_idx, :]   for z in embeddings]   # each (B, max_t, D)
+            T_use = max_t
+        else:
+            z_sub = [z.data for z in embeddings]
+            T_use = T
 
-        # Similarity matrix: (N, N)
-        sim_np = (z_all_np @ z_all_np.T) / self.temperature  # (N, N)
+        # Flatten: (M*B*T_use, D)
+        z_list_np = [zs.reshape(B * T_use, D) for zs in z_sub]
+        z_all_np  = np.concatenate(z_list_np, axis=0)             # (N, D)
+        N  = M * B * T_use
+        BT = B * T_use
+
+        # Similarity matrix: (N, N) — safe at T_use=64, B=32, M=4: N=8192, ~0.5 GB
+        sim_np = (z_all_np @ z_all_np.T) / self.temperature       # (N, N)
 
         # Build positive mask: instance i=(m,bt) is positive with j=(m',bt) for m'!=m, same bt
-        # index i = m * B*T + bt  where bt in [0, B*T)
-        BT = B * T
+        # index i = m * BT + bt  where bt in [0, BT)
+        BT = B * T_use   # use sub-sampled length
         pos_mask = np.zeros((N, N), dtype=np.float64)
         for m_i in range(M):
             for m_j in range(M):
@@ -247,17 +274,20 @@ class CrossModalLatentAlignment(Module):
         )
 
         # Backward through InfoNCE
-        _z_all = z_all_np.copy()
-        _sim = sim_np.copy()
-        _exp_sim = exp_sim.copy()
+        _z_all    = z_all_np.copy()
+        _sim      = sim_np.copy()
+        _exp_sim  = exp_sim.copy()
         _pos_mask = pos_mask.copy()
         _denom_mask = denom_mask.copy()
-        _sum_pos = sum_pos.copy()
+        _sum_pos   = sum_pos.copy()
         _sum_denom = sum_denom.copy()
-        _n_pos = n_pos.copy()
-        _valid = valid.copy()
-        _N_valid = valid.sum()
-        _BT = BT
+        _n_pos     = n_pos.copy()
+        _valid     = valid.copy()
+        _N_valid   = valid.sum()
+        _BT        = BT      # B * T_use (sub-sampled)
+        _T_use     = T_use
+        _T_full    = T       # original full T for scatter-back
+        _t_idx     = t_idx if T > max_t else None   # sub-sample indices or None
         _M = M
         _N = N
 
@@ -280,17 +310,13 @@ class CrossModalLatentAlignment(Module):
             #   ]  for valid anchors i
 
             n_valid = max(_N_valid, 1)
-            # (N, N) gradient of loss w.r.t. sim
-            d_sim = np.zeros((_N, _N), dtype=np.float64)
-            for i in range(_N):
-                if not _valid[i]:
-                    continue
-                sp = _sum_pos[i]
-                sd = _sum_denom[i]
-                d_sim[i] -= _pos_mask[i] * _exp_sim[i] / (sp + 1e-12)
-                d_sim[i] += _denom_mask[i] * _exp_sim[i] / (sd + 1e-12)
-            d_sim /= n_valid
-            d_sim *= g_scalar
+            # Vectorised (N, N) gradient — replaces O(N²) Python loop.
+            # Only valid rows contribute; invalid rows are zeroed via valid_mask.
+            valid_mask = _valid[:, None].astype(np.float64)   # (N, 1)
+            d_sim = (
+                - _pos_mask   * _exp_sim / (_sum_pos[:, None]   + 1e-12)
+                + _denom_mask * _exp_sim / (_sum_denom[:, None] + 1e-12)
+            ) * valid_mask * (g_scalar / n_valid)
 
             # sim = z_all @ z_all.T / temperature
             # d loss / d z_all = (d_sim + d_sim.T) @ z_all / temperature
@@ -298,10 +324,19 @@ class CrossModalLatentAlignment(Module):
             d_z_all = (d_sim + d_sim.T) @ _z_all / self.temperature  # (N, D)
 
             # Distribute gradients back to embeddings
+            # If timesteps were sub-sampled, scatter gradients back to full T
             for m_idx, z_m in enumerate(embeddings):
                 if z_m.requires_grad:
-                    g_slice = d_z_all[m_idx * _BT: (m_idx + 1) * _BT, :]   # (B*T, D)
-                    g_slice = g_slice.reshape(z_m.shape)                      # (B, T, D)
+                    g_sub = d_z_all[m_idx * _BT: (m_idx + 1) * _BT, :]  # (B*T_use, D)
+                    B_loc = z_m.shape[0]
+                    D_loc = z_m.shape[-1]
+                    if _t_idx is not None:
+                        # Scatter into full (B, T, D) gradient tensor
+                        g_full = np.zeros((B_loc, _T_full, D_loc), dtype=np.float32)
+                        g_full[:, _t_idx, :] = g_sub.reshape(B_loc, _T_use, D_loc)
+                        g_slice = g_full
+                    else:
+                        g_slice = g_sub.reshape(z_m.shape)
                     z_m.grad = z_m.grad + g_slice if z_m.grad is not None else g_slice
 
         loss_t._backward = _infonce_back

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 import numpy as np
 
 from engine.tensor import Tensor, Parameter
 from engine.module import Module
 from engine.layers import Linear
 from config import CRGConfig
+
+if TYPE_CHECKING:
+    from memory.causal import CausalMemory
 
 # Edge type labels stored alongside active edges
 EDGE_CAUSAL      = "causal"
@@ -32,8 +36,9 @@ class CausalRoutingGraph(Module):
         self.n_lags = config.n_lags
         self.update_interval = config.update_interval
         self.edge_threshold = 0.01
-        self.ci_threshold: float = getattr(config, "ci_threshold", 0.05)
-        self.n_regimes: int = getattr(config, "n_regimes", 4)
+        self.ci_threshold: float = config.ci_threshold
+        self.n_regimes: int      = config.n_regimes
+        self.max_ci_edges: int   = getattr(config, "max_ci_edges", 64)
 
         # Base adjacency matrix: W_ij = edge strength from node i to node j
         w_init = np.random.randn(config.n_nodes, config.n_nodes).astype(np.float64) * 0.01
@@ -138,28 +143,118 @@ class CausalRoutingGraph(Module):
         """
         For every active edge (i→j), run a conditional independence test
         conditioning on the top-2 confounders.  If the partial correlation
-        |r_ij|z| < ci_threshold, zero out W[i, j] and label the edge
-        EDGE_ASSOCIATIVE; otherwise label it EDGE_CAUSAL.
+        |r_ij|z| < ci_threshold, schedule the edge for pruning.
+
+        Pruning is DEFERRED — edges are collected into `_pending_prune` and
+        applied only when `apply_pending_prune()` is called (from the training
+        loop, after backward + optimizer step).  This prevents mid-graph W.data
+        mutation corrupting a pending backward pass on the same step.
 
         x_history : (T, N) float64
         """
         W_data = self.W.data
         labels: dict[tuple[int, int], str] = {}
+        pending: list[tuple[int, int]] = []
 
         rows, cols = np.where(np.abs(W_data) > self.edge_threshold)
-        for i, j in zip(rows.tolist(), cols.tolist()):
-            if i == j:
-                continue
+        all_edges  = [(int(i), int(j)) for i, j in zip(rows, cols) if i != j]
+
+        # Cap edges checked per call — _top_confounders is O(N) per edge →
+        # O(N²) total. Default max_ci_edges=64 bounds cost to 64 CI tests.
+        max_check = getattr(self, "max_ci_edges", 64)
+        if len(all_edges) > max_check:
+            rng_idx  = np.random.choice(len(all_edges), size=max_check, replace=False)
+            all_edges = [all_edges[k] for k in rng_idx]
+
+        for i, j in all_edges:
             confounders = self._top_confounders(x_history, i, j, k=2)
             pcorr = self._partial_correlation(x_history, i, j, confounders)
             if abs(pcorr) < self.ci_threshold:
-                W_data[i, j] = 0.0
                 labels[(i, j)] = EDGE_ASSOCIATIVE
+                pending.append((i, j))
             else:
                 labels[(i, j)] = EDGE_CAUSAL
 
         object.__setattr__(self, "edge_labels", labels)
-        np.fill_diagonal(W_data, 0.0)
+        # Accumulate (don't replace) so multiple update cycles don't lose edges
+        existing = list(getattr(self, "_pending_prune", []))
+        object.__setattr__(self, "_pending_prune", existing + pending)
+
+    def init_from_graph(
+        self,
+        W_init: np.ndarray,
+        scale: float = 0.1,
+        set_mask: bool = True,
+    ) -> None:
+        """
+        Warm-start the CRG adjacency matrix from a known topology.
+
+        Instead of learning the causal graph from scratch (requires thousands
+        of training steps), provide prior knowledge from:
+          - OT     : P&ID diagram adjacency matrix
+          - IT     : service mesh / call graph (Istio, Consul)
+          - Telecom: RAN cell adjacency (geographic or backhaul topology)
+          - Any domain with a known graph structure
+
+        CRG then REFINES the initialised graph from data (via Granger EMA
+        and DAGMA penalty).  This cuts cold-start time from O(10k steps) to
+        near-zero.
+
+        Parameters
+        ----------
+        W_init   : (n_nodes, n_nodes) float array — known adjacency weights.
+                   Use binary {0, 1} for unweighted topologies or positive
+                   floats for confidence-weighted edges.
+        scale    : float — multiplier applied to W_init before storing.
+                   Default 0.1 keeps initial weights small so gradient
+                   updates dominate quickly.
+        set_mask : bool — if True, also initialise the Neural Granger mask M
+                   so edges present in W_init start with a positive logit
+                   (sigmoid → ~0.73) and absent edges start negative (-3).
+
+        Example
+        -------
+            # From a service mesh call graph
+            adj = np.array([[0,1,0],[1,0,1],[0,0,0]], dtype=np.float32)
+            model.crg.init_from_graph(adj)
+
+            # From a pandas DataFrame of known P&ID connections
+            adj = nx.to_numpy_array(pid_graph, nodelist=sensor_names)
+            model.crg.init_from_graph(adj, scale=0.2)
+        """
+        assert W_init.shape == (self.n_nodes, self.n_nodes), (
+            f"W_init shape {W_init.shape} must match "
+            f"(n_nodes={self.n_nodes}, n_nodes={self.n_nodes})"
+        )
+        W = (np.asarray(W_init, dtype=np.float32) * scale)
+        np.fill_diagonal(W, 0.0)
+        self.W.data = W
+
+        if set_mask:
+            # Edges present in W_init → logit +3 (sigmoid ≈ 0.95)
+            # Absent edges          → logit -3 (sigmoid ≈ 0.05)
+            M = np.where(np.abs(W_init) > 0, 3.0, -3.0).astype(np.float32)
+            np.fill_diagonal(M, -10.0)
+            self.M.data = M
+
+    def apply_pending_prune(self) -> int:
+        """
+        Apply deferred edge pruning to W.data and M.data.
+
+        Call this AFTER backward() + optimizer.step() — never inside a forward
+        pass — so the in-place mutation doesn't corrupt a pending backward graph.
+
+        Returns the number of edges pruned.
+        """
+        pending: list[tuple[int, int]] = list(getattr(self, "_pending_prune", []))
+        if not pending:
+            return 0
+        for i, j in pending:
+            self.W.data[i, j] = 0.0
+            self.M.data[i, j] = -10.0   # drive sigmoid(M) → 0 for pruned edges
+        np.fill_diagonal(self.W.data, 0.0)
+        object.__setattr__(self, "_pending_prune", [])
+        return len(pending)
 
     # ------------------------------------------------------------------
 
@@ -397,7 +492,7 @@ class CausalRoutingGraph(Module):
                         confidence=float(new_acc[i, j])
                     )
 
-    def attach_causal_memory(self, causal_memory) -> None:
+    def attach_causal_memory(self, causal_memory: "CausalMemory") -> None:
         """Attach a CausalMemory instance; CRG writes discovered edges into it."""
         object.__setattr__(self, "_causal_memory", causal_memory)
 

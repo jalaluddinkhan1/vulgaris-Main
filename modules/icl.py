@@ -29,11 +29,15 @@ from __future__ import annotations
 
 """
 
+from typing import TYPE_CHECKING
 import numpy as np
 
 from engine.tensor import Tensor, Parameter
 from engine.module import Module
 from engine.layers import Linear, RMSNorm, CrossAttention
+
+if TYPE_CHECKING:
+    from memory.episodic import EpisodicMemory
 
 
 class ContextEncoder(Module):
@@ -184,7 +188,7 @@ class InContextLearning(Module):
     """
 
     def __init__(self, d_model: int, output_dim: int, n_heads: int = 4,
-                 episodic_memory=None):
+                 episodic_memory: "EpisodicMemory | None" = None):
         super().__init__()
         self.encoder        = ContextEncoder(d_model=d_model, output_dim=output_dim)
         self.adapter        = InContextAdapter(d_model=d_model, n_heads=n_heads)
@@ -263,10 +267,12 @@ class InContextLearning(Module):
         stacked_t._backward = _stack_back
         return stacked_t
 
-    def forward(self, z: Tensor, ctx_stack: Tensor) -> Tensor:
+    def forward(self, z: Tensor, ctx_stack: "Tensor | None") -> Tensor:
         """
         z         : (B, T, d_model)
-        ctx_stack : (B, n_ctx, d_model)
+        ctx_stack : (B, n_ctx, d_model) or None — when None, returns z unchanged.
         Returns   : (B, T, d_model) — z conditioned on context
         """
+        if ctx_stack is None:
+            return z
         return self.adapter(z, ctx_stack)

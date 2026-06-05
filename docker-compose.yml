@@ -1,31 +1,49 @@
-version: "3.9"
+# docker compose up              — inference server + Prometheus
+# docker compose up vulgaris     — server only
+# docker compose --profile gpu up — future GPU variant
 
 services:
   vulgaris:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vulgaris:latest
     ports:
-      - "8000:8000"
+      - "${VULGARIS_PORT:-8000}:8000"
     environment:
-      - VULGARIS_INPUT_DIM=9
-      - VULGARIS_OUTPUT_DIM=1
-      - VULGARIS_N_CLASSES=5
-      - VULGARIS_D_MODEL=256
-      - VULGARIS_N_DOMAINS=32
-      - VULGARIS_RMC_EXPERTS=4
-      - VULGARIS_API_KEYS=${VULGARIS_API_KEYS:-}
-      - VULGARIS_LOG_LEVEL=INFO
-      - VULGARIS_CHECKPOINT=${VULGARIS_CHECKPOINT:-}
-      - VULGARIS_PORT=8000
-    mem_limit: 2g
+      VULGARIS_INPUT_DIM:    ${VULGARIS_INPUT_DIM:-9}
+      VULGARIS_OUTPUT_DIM:   ${VULGARIS_OUTPUT_DIM:-1}
+      VULGARIS_N_CLASSES:    ${VULGARIS_N_CLASSES:-5}
+      VULGARIS_D_MODEL:      ${VULGARIS_D_MODEL:-256}
+      VULGARIS_N_DOMAINS:    ${VULGARIS_N_DOMAINS:-32}
+      VULGARIS_RMC_EXPERTS:  ${VULGARIS_RMC_EXPERTS:-4}
+      VULGARIS_API_KEYS:     ${VULGARIS_API_KEYS:-}
+      VULGARIS_LOG_LEVEL:    ${VULGARIS_LOG_LEVEL:-INFO}
+      VULGARIS_CHECKPOINT:   ${VULGARIS_CHECKPOINT:-}
+      VULGARIS_PORT:         8000
+    volumes:
+      - checkpoints:/app/checkpoints
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+        reservations:
+          memory: 512m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
-    volumes:
-      - ./checkpoints:/app/checkpoints
+      start_period: 20s
+    networks:
+      - vulgaris-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
 
   prometheus:
     image: prom/prometheus:v2.47.0
@@ -33,8 +51,31 @@ services:
       - "9090:9090"
     volumes:
       - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=7d"
-    mem_limit: 512m
+      - "--web.enable-lifecycle"
+    depends_on:
+      vulgaris:
+        condition: service_healthy
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - vulgaris-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  checkpoints:
+  prometheus-data:
+
+networks:
+  vulgaris-net:
+    driver: bridge
